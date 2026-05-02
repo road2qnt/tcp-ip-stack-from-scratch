@@ -16,6 +16,23 @@ static int map_find_index(const Map *map, const char *key)
     return -1;
 }
 
+static int map_mac_find_index(const Map_MAC *map, const MacAddress *key)
+{
+    size_t i;
+
+    if (map == NULL || key == NULL) {
+        return -1;
+    }
+
+    for (i = 0; i < map->size; i++) {
+        if (memcmp(map->keys[i].bytes, key->bytes, sizeof(key->bytes)) == 0) {
+            return (int)i;
+        }
+    }
+
+    return -1;
+}
+
 static void copy_string(char destination[], size_t destination_size, const char *source)
 {
     if (destination_size == 0) {
@@ -106,4 +123,84 @@ const char *map_get_const(const Map *map, const char *key)
     }
 
     return map->values[index];
+}
+
+void map_mac_init(Map_MAC *map)
+{
+    if (map == NULL) {
+        return;
+    }
+
+    map->size = 0;
+}
+
+int map_mac_insert(Map_MAC *map, const MacAddress *key, int value)
+{
+    int index;
+
+    if (map == NULL || key == NULL) {
+        return 0;
+    }
+
+    index = map_mac_find_index(map, key);
+    if (index >= 0) {
+        map->values[index] = value;
+        return 1;
+    }
+
+    if (map->size >= MAP_MAX_ENTRIES) {
+        return 0;
+    }
+
+    map->keys[map->size] = *key;
+    map->values[map->size] = value;
+    map->size++;
+
+    return 1;
+}
+
+int map_mac_remove(Map_MAC *map, const MacAddress *key)
+{
+    int index;
+    size_t i;
+
+    if (map == NULL || key == NULL) {
+        return 0;
+    }
+
+    index = map_mac_find_index(map, key);
+    if (index < 0) {
+        return 0;
+    }
+
+    for (i = (size_t)index; i + 1 < map->size; i++) {
+        map->keys[i] = map->keys[i + 1];
+        map->values[i] = map->values[i + 1];
+    }
+
+    map->size--;
+
+    return 1;
+}
+
+int *map_mac_get(Map_MAC *map, const MacAddress *key)
+{
+    int index = map_mac_find_index(map, key);
+
+    if (index < 0) {
+        return NULL;
+    }
+
+    return &map->values[index];
+}
+
+const int *map_mac_get_const(const Map_MAC *map, const MacAddress *key)
+{
+    int index = map_mac_find_index(map, key);
+
+    if (index < 0) {
+        return NULL;
+    }
+
+    return &map->values[index];
 }
