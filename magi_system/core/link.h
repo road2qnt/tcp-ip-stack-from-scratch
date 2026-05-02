@@ -20,8 +20,8 @@ typedef struct Link {
 
 // Method
 
-void init_(Link* self, Interface* interface1_, Interface* interface2_, float delay_);
+Link link_init(Interface* interface1_, Interface* interface2_, float delay_);
 // Transmit Data (Signal)
-void transmit(Interface* sender, Link* link, Packet* packet);
+void transmit(Interface* sender, Link* link, uint8_t* packet);
 
 #endif

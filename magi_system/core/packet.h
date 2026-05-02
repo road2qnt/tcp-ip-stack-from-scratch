@@ -2,15 +2,23 @@
 #define PACKET_H
 
 #include "interface.h"
-typedef struct Packet{
-    /*
-        1. Saat di send() : Packet berubah menjadi byte
-        
-    */
-} Packet;
 
-// Method
-void packet_receive(Interface* receiver, Packet* packet);
-void packet_send(Interface* sender, Packet* packet);
+typedef enum PacketType{
+    ETHERNET,
+    ARP,
+    IPV4,
+    TCP,
+    UDP,
+    // etc, ...
+} PacketType;
+
+typedef struct Packet Packet;
+typedef struct Packet{
+    PacketType type;
+    size_t (*to_bytes) (const Packet* self, uint8_t* out); // Hasil: Pointer ke byte dan ukurannya
+};
+
+
+
 
 #endif
