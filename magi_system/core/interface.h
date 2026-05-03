@@ -3,6 +3,7 @@
 
 #include "mac_ip.h"
 #include "../dataStructure/map.h"
+#include "../layer3/ipv4.h"
 
 #define MAX_NAME 32
 #define MAX_PORT 32
