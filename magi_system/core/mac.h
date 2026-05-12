@@ -1,5 +1,5 @@
-#ifndef MAC_IP_H
-#define MAC_IP_H
+#ifndef MAC_H
+#define MAC_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -11,8 +11,5 @@ typedef struct MacAddress{
 // Method - Mac Address
 MacAddress mac_random();
 bool mac_equal(MacAddress* mac_1, MacAddress* mac_2); 
-
-
-
 
 #endif

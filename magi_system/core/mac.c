@@ -1,4 +1,5 @@
-#include "mac_ip.h"
+#include "mac.h"
+#include <stdlib.h>
 
 MacAddress mac_random(){
     MacAddress mac;
@@ -16,4 +17,3 @@ bool mac_equal(MacAddress* mac_1, MacAddress* mac_2){
     }
     return true;
 }
-

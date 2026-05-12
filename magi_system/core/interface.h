@@ -1,9 +1,8 @@
-#ifndef INTEFACE_H
+#ifndef INTERFACE_H
 #define INTERFACE_H
 
-#include "mac_ip.h"
-#include "../dataStructure/map.h"
-#include "../layer3/ipv4.h"
+#include "mac.h"
+#include <stddef.h>
 
 #define MAX_NAME 32
 #define MAX_PORT 32
@@ -11,48 +10,46 @@
 // Forward Declaration
 typedef struct Link Link; 
 typedef struct Node Node; 
+typedef struct NodeVTable NodeVTable;
+
+typedef enum NodeType {
+    NODE_UNKNOWN,
+    NODE_HOST,
+    NODE_SWITCH,
+    NODE_ROUTER
+} NodeType;
 
 // === MAIN ===
 typedef struct Interface{
     int portNumber;
     MacAddress Mac_Address;
-    IpAddress ip_address;
-    IpAddress default_gateway;
-
-    // Tambahan
-    bool has_ip; 
     Link* link;
     Node* node;
 } Interface;
 
 Interface interface_init(int num, MacAddress mac);
-void send(Interface* sender, uint8_t raw); // bytes
-void receive(Interface* receiver, uint8_t raw);
+void send(Interface* sender, const uint8_t* raw, size_t raw_len);
+void receive(Interface* receiver, const uint8_t* raw, size_t raw_len);
 
 // Abstract Class
-typedef struct Node{
+struct NodeVTable {
+    void (*receive)(Node* self, Interface* in_interface, const uint8_t* raw, size_t raw_len);
+};
+
+struct Node{
+    NodeType type;
+    const NodeVTable* vtable;
     char NAME[MAX_NAME];
     int NUM_INTERFACES;
-    Interface* interfaces[MAX_PORT];
-}Node;
+    Interface interfaces[MAX_PORT];
+};
 
-Node node_init(int num, Interface* interface);
-
-// Objek yang memakai interface
-typedef struct Host{
-    Node base;
-}Host;
-
-typedef struct Switch{
-    Node base;
-}Switch;
-
-typedef struct Router{
-    Node base;
-}Router;
-
-// P.S. (Reminder)
-// 1. Map : buat MAC Table
+void node_init(Node* node, NodeType type, int num_interfaces);
+void node_init_with_macs(Node* node, NodeType type, int num_interfaces, const MacAddress* mac_addresses);
+void node_set_vtable(Node* node, const NodeVTable* vtable);
+Interface* node_get_interface(Node* node, int port_number);
+const Interface* node_get_interface_const(const Node* node, int port_number);
+void node_receive(Node* node, Interface* in_interface, const uint8_t* raw, size_t raw_len);
+const char* node_type_to_string(NodeType type);
 
 #endif
-
