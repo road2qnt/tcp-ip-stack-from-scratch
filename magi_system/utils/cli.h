@@ -1,11 +1,11 @@
 #ifndef CLI_H
 #define CLI_H
 
-#include "core/interface.h"
-#include "core/link.h"
+#include "../simulator.h"
 
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
 /*
