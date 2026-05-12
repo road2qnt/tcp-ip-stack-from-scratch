@@ -14,7 +14,7 @@ Malaikat ke-11, Ireul, telah menginfeksi dan menghancurkan seluruh protokol komu
 
 ## Prerequisites & Setup
 
-* **Bahasa Pemrograman:** [Isi dengan bahasa pilihan kelompok Anda, e.g., Python, C++, Go].
+* **Bahasa Pemrograman:** C
 * Pilihan bahasa pemrograman memengaruhi *Language Multiplier* pada penilaian akhir.
 * Penggunaan *Large Language Models* (LLM) diizinkan sebagai asisten belajar, namun setiap baris kode wajib dipahami seutuhnya.
 * Gagal menjelaskan alur eksekusi saat demonstrasi akan dianggap sebagai plagiarisme.
@@ -42,7 +42,9 @@ Centang (*checklist*) kotak di bawah ini sesuai dengan *layer* yang telah kelomp
 
 [Deskripsikan dengan jelas anggota kelompok dan *milestone* yang mereka kerjakan, ini wajib diisi sesuai instruksi pengumpulan repositori.]
 
-* **Anggota 1 (NIM):** [Bagian yang dikerjakan]
-* **Anggota 2 (NIM):** [Bagian yang dikerjakan]
-* **Anggota 3 (NIM):** [Bagian yang dikerjakan]
-* **Anggota 4/5 (NIM):** [Bagian yang dikerjakan]
+* **Anggota 1 13524115 (Ega Luthfi Rais):** [Bagian yang dikerjakan]
+* **Anggota 2 13524141 (Ahmad Fauzan Putra):** [Bagian yang dikerjakan]
+* **Anggota 3 13524146 (Leonardus Brain Fatolosja):** [Bagian yang dikerjakan]
+* **Anggota 4 13524134 (Salman Faiz Assidqi):** [Bagian yang dikerjakan]
+* **Anggota 5 13524124 (Zahran Alvan Putra Winarko):** [Bagian yang dikerjakan]
+
