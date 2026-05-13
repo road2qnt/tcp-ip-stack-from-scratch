@@ -1,8 +1,6 @@
 #ifndef MAP_H
 #define MAP_H
 
-#include "../core/mac.h"
-
 #include <stddef.h>
 #include <string.h>
 
@@ -22,18 +20,5 @@ int map_insert(Map *map, const char *key, const char *value);
 int map_remove(Map *map, const char *key);
 char *map_get(Map *map, const char *key);
 const char *map_get_const(const Map *map, const char *key);
-
-// Map (MacAddress-Int(PortNumber))
-typedef struct Map_MAC {
-    size_t size;
-    MacAddress keys[MAP_MAX_ENTRIES]; // Mac Address
-    int values[MAP_MAX_ENTRIES]; // Port Number
-} Map_MAC;
-
-void map_mac_init(Map_MAC *map);
-int map_mac_insert(Map_MAC *map, const MacAddress *key, int value);
-int map_mac_remove(Map_MAC *map, const MacAddress *key);
-int *map_mac_get(Map_MAC *map, const MacAddress *key);
-const int *map_mac_get_const(const Map_MAC *map, const MacAddress *key);
 
 #endif
