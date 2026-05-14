@@ -1,4 +1,7 @@
 #include "cli.h"
+#include "loader.h"
+#include "visualizer.h"
+#include "debugger.h"
 
 #define MAX_COMMAND_LENGTH 100
 
@@ -123,6 +126,31 @@ bool process(char* command){
             printf("[SIM] Loaded topology from %s\n", filename);
         } else {
             printf("[SIM] Failed to load topology from %s\n", filename);
+        }
+        return true;
+    } else if (strcmp(tokens[0], "debug") == 0){
+        const char *target = count >= 2 ? tokens[1] : "help";
+
+        if (strcmp(target, "m0") == 0 || strcmp(target, "0") == 0) {
+            debug_milestone_0(&simulator);
+        } else if (strcmp(target, "m1") == 0 || strcmp(target, "1") == 0) {
+            debug_milestone_1(&simulator);
+        } else if (strcmp(target, "m2") == 0 || strcmp(target, "2") == 0) {
+            debug_milestone_2(&simulator);
+        } else if (strcmp(target, "m3") == 0 || strcmp(target, "3") == 0) {
+            debug_milestone_3(&simulator);
+        } else if (strcmp(target, "m4") == 0 || strcmp(target, "4") == 0) {
+            debug_milestone_4(&simulator);
+        } else if (strcmp(target, "all") == 0) {
+            debug_run_all(&simulator);
+        } else {
+            printf("Debug targets:\n");
+            printf("  debug m0   - Milestone 0: Fondasi Simulasi\n");
+            printf("  debug m1   - Milestone 1: Data Link Layer\n");
+            printf("  debug m2   - Milestone 2: Network Layer\n");
+            printf("  debug m3   - Milestone 3: Transport Layer\n");
+            printf("  debug m4   - Milestone 4: Application Layer\n");
+            printf("  debug all  - Run all milestone tests\n");
         }
         return true;
     } else if (strcmp(tokens[0], "topology") == 0){

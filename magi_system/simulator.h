@@ -45,6 +45,10 @@ int simulator_create_node(Simulator *simulator,const char *type,const char *name
 int simulator_link(Simulator *simulator,const char *endpoint_a,const char *endpoint_b,float delay_ms);
 int simulator_unlink(Simulator *simulator,const char *endpoint_a,const char *endpoint_b);
 
+// Remove a specific node by name (also removes associated links)
+int simulator_remove_node(Simulator *simulator, const char *name);
 
+// Utility function (used by loader too)
+int simulator_find_node(const Simulator *simulator, const char *name);
 
 #endif 

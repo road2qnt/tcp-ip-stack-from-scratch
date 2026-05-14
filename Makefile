@@ -10,8 +10,16 @@ SRCS := \
 	magi_system/core/mac.c \
 	magi_system/core/packet.c \
 	magi_system/dataStructure/map.c \
+	magi_system/layer2/host.c \
+	magi_system/layer2/switch.c \
+	magi_system/layer2/arp.c \
 	magi_system/layer3/ipv4.c \
-	magi_system/utils/cli.c
+	magi_system/layer3/router.c \
+	magi_system/utils/cli.c \
+	magi_system/utils/json.c \
+	magi_system/utils/loader.c \
+	magi_system/utils/visualizer.c \
+	magi_system/utils/debugger.c
 
 .PHONY: run build clean
 
