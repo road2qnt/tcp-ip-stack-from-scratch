@@ -16,7 +16,7 @@ typedef struct HostPendingPacket {
 } HostPendingPacket;
 
 typedef struct HostPendingQueue {
-    HostPendingPacket items[HOST_PENDING_QUEUE_MAX_ENTRIES];
+    HostPendingPacket items[HOST_PENDING_QUEUE_MAX_ENTRIES];    
     size_t head;
     size_t tail;
     size_t size;
@@ -42,5 +42,7 @@ int host_dequeue_pending_packet_for_ip(Host* host, const IpAddress* target_ip, H
 size_t host_pending_count_for_ip(const Host* host, const IpAddress* target_ip);
 
 int host_learn_arp(Host* host, const ARPMessage* message);
+int host_send_l3_packet(Host* host, const IpAddress* target_ip, uint16_t ethertype, const uint8_t* payload, size_t payload_len);
+int host_flush_pending_packets(Host* host, const IpAddress* resolved_ip);
 
 #endif
