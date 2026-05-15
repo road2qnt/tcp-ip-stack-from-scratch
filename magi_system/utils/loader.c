@@ -15,38 +15,13 @@
 // Parse "192.168.1.10/24" into IpAddress struct
 static int parse_ip_address(const char *str, IpAddress *ip)
 {
-    if (str == NULL || ip == NULL) return 0;
-
-    unsigned int octets[4];
-    int prefix;
-    int count = sscanf(str, "%u.%u.%u.%u/%d", &octets[0], &octets[1], &octets[2], &octets[3], &prefix);
-
-    if (count != 5) {
-        // Try without prefix
-        count = sscanf(str, "%u.%u.%u.%u", &octets[0], &octets[1], &octets[2], &octets[3]);
-        if (count != 4) return 0;
-        prefix = 0;
-    }
-
-    for (int i = 0; i < 4; i++) {
-        if (octets[i] > 255) return 0;
-        ip->octet[i] = (uint8_t)octets[i];
-    }
-    ip->prefix = (uint8_t)prefix;
-    return 1;
+    return ip_parse(str, ip);
 }
 
 // Format IpAddress back to "192.168.1.10/24" string
 static void ip_address_to_string(const IpAddress *ip, char *out, size_t out_size)
 {
-    if (ip->prefix > 0) {
-        snprintf(out, out_size, "%d.%d.%d.%d/%d",
-                 ip->octet[0], ip->octet[1], ip->octet[2], ip->octet[3],
-                 ip->prefix);
-    } else {
-        snprintf(out, out_size, "%d.%d.%d.%d",
-                 ip->octet[0], ip->octet[1], ip->octet[2], ip->octet[3]);
-    }
+    ip_to_string(ip, out, out_size, ip->prefix > 0);
 }
 
 // ==================== SIMULATOR SAVE ====================
@@ -154,8 +129,21 @@ int simulator_save(Simulator *simulator, const char *filename)
         }
         json_object_add(r, "interfaces", intfs_arr);
 
-        // Routing table - currently empty (will be implemented in M2)
         JsonValue *rt_arr = json_create_array();
+        for (size_t rt = 0; rt < rtr->route_count; rt++) {
+            const RoutingTableEntry *entry = &rtr->routing_table[rt];
+            JsonValue *route = json_create_object();
+            char destination[64];
+            char next_hop[64];
+
+            ip_to_string(&entry->destination, destination, sizeof(destination), true);
+            ip_to_string(&entry->next_hop, next_hop, sizeof(next_hop), false);
+
+            json_object_add(route, "destination", json_create_string(destination));
+            json_object_add(route, "next_hop", json_create_string(next_hop));
+            json_object_add(route, "interface", json_create_number((double)entry->out_interface));
+            json_array_add(rt_arr, route);
+        }
         json_object_add(r, "routing_table", rt_arr);
 
         json_array_add(routers_arr, r);
@@ -374,7 +362,40 @@ int simulator_load(Simulator *simulator, const char *filename)
                 }
             }
 
-            // Note: routing table entries will be loaded when routing table struct is added in M2
+            router_add_direct_routes(rtr);
+
+            JsonValue *rt_arr = json_object_get(r, "routing_table");
+            if (rt_arr != NULL && rt_arr->type == JSON_ARRAY) {
+                for (size_t j = 0; j < rt_arr->data.array.count; j++) {
+                    JsonValue *route = json_array_get(rt_arr, j);
+                    IpAddress destination;
+                    IpAddress next_hop;
+                    uint8_t zero[] = {0, 0, 0, 0};
+                    int out_interface;
+
+                    if (route == NULL || route->type != JSON_OBJECT) continue;
+
+                    JsonValue *dst_val = json_object_get(route, "destination");
+                    JsonValue *next_val = json_object_get(route, "next_hop");
+                    JsonValue *iface_val = json_object_get(route, "interface");
+                    if (dst_val == NULL || dst_val->type != JSON_STRING ||
+                        iface_val == NULL || iface_val->type != JSON_NUMBER) {
+                        continue;
+                    }
+
+                    if (!parse_ip_address(dst_val->data.string, &destination)) {
+                        continue;
+                    }
+
+                    next_hop = ip_init(zero, 0);
+                    if (next_val != NULL && next_val->type == JSON_STRING) {
+                        parse_ip_address(next_val->data.string, &next_hop);
+                    }
+
+                    out_interface = (int)iface_val->data.number;
+                    router_add_route(rtr, destination, next_hop, out_interface);
+                }
+            }
         }
     }
 

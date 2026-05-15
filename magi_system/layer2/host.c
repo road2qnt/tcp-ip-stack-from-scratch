@@ -1,5 +1,6 @@
 #include "host.h"
 #include "../core/packet.h"
+#include "../layer3/icmp.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -172,6 +173,8 @@ static void host_receive(Node* self, Interface* in_interface, const uint8_t* raw
     Host* host = (Host*)self;
     EthernetFrame frame;
     ARPMessage arp;
+    IPv4Packet ip_packet;
+    ICMPMessage icmp;
     MacAddress* host_mac;
 
     (void)in_interface;
@@ -220,7 +223,79 @@ static void host_receive(Node* self, Interface* in_interface, const uint8_t* raw
     }
 
     if (frame.ethertype == ETHERNET_TYPE_IPV4) {
-        printf("[%s] IPv4 payload received (%zu bytes)\n", host->base.NAME, frame.payload_len);
+        ipv4_init(&ip_packet);
+        if (!packet_from_bytes((Packet*)&ip_packet, frame.payload, frame.payload_len) ||
+            !ipv4_validate_checksum(&ip_packet)) {
+            printf("[%s] Dropped invalid IPv4 packet\n", host->base.NAME);
+            return;
+        }
+
+        if (!host->has_ip || !ip_octets_equal_public(&ip_packet.dst_ip, &host->ip_address)) {
+            return;
+        }
+
+        if (ip_packet.protocol != IPV4_PROTOCOL_ICMP) {
+            printf("[%s] IPv4 protocol %u not supported\n", host->base.NAME, ip_packet.protocol);
+            return;
+        }
+
+        icmp_init(&icmp);
+        if (!packet_from_bytes((Packet*)&icmp, ip_packet.payload, ip_packet.payload_len) ||
+            !icmp_validate_checksum(&icmp)) {
+            printf("[%s] Dropped invalid ICMP message\n", host->base.NAME);
+            return;
+        }
+
+        host->last_icmp_type = icmp.type;
+        host->last_icmp_source = ip_packet.src_ip;
+        host->last_icmp_sequence = icmp.sequence;
+        host->has_last_icmp = true;
+
+        if (icmp.type == ICMP_ECHO_REQUEST) {
+            ICMPMessage reply;
+            uint8_t icmp_raw[ICMP_HEADER_SIZE + ICMP_MAX_PAYLOAD];
+            size_t icmp_len;
+            IPv4Packet response;
+            uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
+            size_t ip_len;
+
+            printf("[%s] ICMP Echo Request received from ", host->base.NAME);
+            print_ip_address(&ip_packet.src_ip);
+            printf("\n");
+
+            if (!icmp_create(&reply, ICMP_ECHO_REPLY, 0, icmp.identifier, icmp.sequence,
+                             icmp.payload, icmp.payload_len)) {
+                return;
+            }
+
+            icmp_len = packet_to_bytes((Packet*)&reply, icmp_raw, sizeof(icmp_raw));
+            if (icmp_len == 0 ||
+                !ipv4_create(&response, host->ip_address, ip_packet.src_ip, IPV4_DEFAULT_TTL,
+                             IPV4_PROTOCOL_ICMP, icmp_raw, icmp_len)) {
+                return;
+            }
+
+            ip_len = packet_to_bytes((Packet*)&response, ip_raw, sizeof(ip_raw));
+            if (ip_len == 0) {
+                return;
+            }
+
+            host_send_l3_packet(host, &ip_packet.src_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
+        } else if (icmp.type == ICMP_ECHO_REPLY) {
+            printf("%s: Reply from ", host->base.NAME);
+            print_ip_address(&ip_packet.src_ip);
+            printf(": bytes=%zu time=0ms TTL=%u\n", icmp.payload_len, ip_packet.ttl);
+        } else if (icmp.type == ICMP_TIME_EXCEEDED) {
+            printf("%s: ICMP Time Exceeded from ", host->base.NAME);
+            print_ip_address(&ip_packet.src_ip);
+            printf("\n");
+        } else if (icmp.type == ICMP_DEST_UNREACHABLE) {
+            printf("%s: ICMP Destination Unreachable from ", host->base.NAME);
+            print_ip_address(&ip_packet.src_ip);
+            printf("\n");
+        } else {
+            printf("[%s] ICMP type %u received\n", host->base.NAME, icmp.type);
+        }
         return;
     }
 
@@ -245,6 +320,9 @@ void host_init_with_macs(Host* host, int num_interfaces, const MacAddress* mac_a
     node_init_with_macs(&host->base, NODE_HOST, num_interfaces, mac_addresses);
     node_set_vtable(&host->base, &HOST_VTABLE);
     host->has_ip = false;
+    host->has_last_icmp = false;
+    host->last_icmp_type = 0;
+    host->last_icmp_sequence = 0;
     arp_table_init(&host->arp_table);
     host_pending_queue_init(&host->pending_queue);
 }
@@ -408,4 +486,44 @@ int host_flush_pending_packets(Host* host, const IpAddress* resolved_ip)
     }
 
     return sent;
+}
+
+int host_send_icmp_echo_request(Host* host, const IpAddress* target_ip, uint8_t ttl, uint16_t sequence)
+{
+    uint8_t payload[32];
+    ICMPMessage icmp;
+    uint8_t icmp_raw[ICMP_HEADER_SIZE + ICMP_MAX_PAYLOAD];
+    size_t icmp_len;
+    IPv4Packet packet;
+    uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
+    size_t ip_len;
+
+    if (host == NULL || target_ip == NULL || !host->has_ip) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)i;
+    }
+
+    host->has_last_icmp = false;
+    if (!icmp_create(&icmp, ICMP_ECHO_REQUEST, 0, 0x1234, sequence, payload, sizeof(payload))) {
+        return 0;
+    }
+
+    icmp_len = packet_to_bytes((Packet*)&icmp, icmp_raw, sizeof(icmp_raw));
+    if (icmp_len == 0) {
+        return 0;
+    }
+
+    if (!ipv4_create(&packet, host->ip_address, *target_ip, ttl, IPV4_PROTOCOL_ICMP, icmp_raw, icmp_len)) {
+        return 0;
+    }
+
+    ip_len = packet_to_bytes((Packet*)&packet, ip_raw, sizeof(ip_raw));
+    if (ip_len == 0) {
+        return 0;
+    }
+
+    return host_send_l3_packet(host, target_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
 }

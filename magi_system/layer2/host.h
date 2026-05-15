@@ -28,6 +28,10 @@ typedef struct Host{
     IpAddress ip_address;
     IpAddress default_gateway;
     bool has_ip;
+    uint8_t last_icmp_type;
+    IpAddress last_icmp_source;
+    uint16_t last_icmp_sequence;
+    bool has_last_icmp;
     // Tambahan untuk Host (ARP Table: IP -> MAC)
     ArpTable arp_table;
     HostPendingQueue pending_queue;
@@ -44,5 +48,6 @@ size_t host_pending_count_for_ip(const Host* host, const IpAddress* target_ip);
 int host_learn_arp(Host* host, const ARPMessage* message);
 int host_send_l3_packet(Host* host, const IpAddress* target_ip, uint16_t ethertype, const uint8_t* payload, size_t payload_len);
 int host_flush_pending_packets(Host* host, const IpAddress* resolved_ip);
+int host_send_icmp_echo_request(Host* host, const IpAddress* target_ip, uint8_t ttl, uint16_t sequence);
 
 #endif

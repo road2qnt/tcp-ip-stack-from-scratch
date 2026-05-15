@@ -2,6 +2,9 @@
 #include "loader.h"
 #include "visualizer.h"
 #include "debugger.h"
+#include "../layer2/host.h"
+#include "../layer3/router.h"
+#include "../layer3/icmp.h"
 
 #define MAX_COMMAND_LENGTH 100
 
@@ -16,7 +19,84 @@ static void print_help(void)
     printf("  save [filename]\n");
     printf("  load [filename]\n");
     printf("  topology\n");
+    printf("  <host> ping <ip|host>\n");
+    printf("  <host> traceroute <ip|host>\n");
+    printf("  <router> route\n");
     printf("  exit | quit\n");
+}
+
+static int resolve_ip_target(const char* token, IpAddress* out_ip)
+{
+    int idx;
+
+    if (token == NULL || out_ip == NULL) {
+        return 0;
+    }
+
+    if (ip_parse(token, out_ip)) {
+        return 1;
+    }
+
+    idx = simulator_find_node(&simulator, token);
+    if (idx < 0) {
+        return 0;
+    }
+
+    if (simulator.nodes[idx].type == SIM_NODE_HOST) {
+        Host* host = (Host*)simulator.nodes[idx].node;
+        if (host->has_ip) {
+            *out_ip = host->ip_address;
+            return 1;
+        }
+    } else if (simulator.nodes[idx].type == SIM_NODE_ROUTER) {
+        Router* router = (Router*)simulator.nodes[idx].node;
+        for (int i = 0; i < router->base.NUM_INTERFACES; i++) {
+            if (router->interface_ips[i].has_ip) {
+                *out_ip = router->interface_ips[i].ip_address;
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int cli_find_host(const char* name, Host** out_host)
+{
+    int idx;
+
+    if (out_host != NULL) {
+        *out_host = NULL;
+    }
+
+    idx = simulator_find_node(&simulator, name);
+    if (idx < 0 || simulator.nodes[idx].type != SIM_NODE_HOST) {
+        return 0;
+    }
+
+    if (out_host != NULL) {
+        *out_host = (Host*)simulator.nodes[idx].node;
+    }
+    return 1;
+}
+
+static int cli_find_router(const char* name, Router** out_router)
+{
+    int idx;
+
+    if (out_router != NULL) {
+        *out_router = NULL;
+    }
+
+    idx = simulator_find_node(&simulator, name);
+    if (idx < 0 || simulator.nodes[idx].type != SIM_NODE_ROUTER) {
+        return 0;
+    }
+
+    if (out_router != NULL) {
+        *out_router = (Router*)simulator.nodes[idx].node;
+    }
+    return 1;
 }
 
 void cli(){
@@ -155,6 +235,77 @@ bool process(char* command){
         return true;
     } else if (strcmp(tokens[0], "topology") == 0){
         simulator_print_topology(&simulator);
+        return true;
+    } else if (count >= 2 && strcmp(tokens[1], "ping") == 0) {
+        Host* host;
+        IpAddress target_ip;
+
+        if (count < 3) {
+            printf("Usage: <host> ping <ip|host>\n");
+            return true;
+        }
+
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+
+        if (!resolve_ip_target(tokens[2], &target_ip)) {
+            printf("Invalid target: %s\n", tokens[2]);
+            return true;
+        }
+
+        host_send_icmp_echo_request(host, &target_ip, IPV4_DEFAULT_TTL, 1);
+        return true;
+    } else if (count >= 2 && strcmp(tokens[1], "traceroute") == 0) {
+        Host* host;
+        IpAddress target_ip;
+        char target[32];
+
+        if (count < 3) {
+            printf("Usage: <host> traceroute <ip|host>\n");
+            return true;
+        }
+
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+
+        if (!resolve_ip_target(tokens[2], &target_ip)) {
+            printf("Invalid target: %s\n", tokens[2]);
+            return true;
+        }
+
+        ip_to_string(&target_ip, target, sizeof(target), false);
+        printf("traceroute to %s\n", target);
+        for (uint8_t ttl = 1; ttl <= 30; ttl++) {
+            host_send_icmp_echo_request(host, &target_ip, ttl, ttl);
+            if (!host->has_last_icmp) {
+                printf("%u  *\n", ttl);
+                continue;
+            }
+
+            char hop[32];
+            ip_to_string(&host->last_icmp_source, hop, sizeof(hop), false);
+            printf("%u  %s  0ms\n", ttl, hop);
+            if (host->last_icmp_type == ICMP_ECHO_REPLY) {
+                break;
+            }
+            if (host->last_icmp_type == ICMP_DEST_UNREACHABLE) {
+                break;
+            }
+        }
+        return true;
+    } else if (count >= 2 && strcmp(tokens[1], "route") == 0) {
+        Router* router;
+
+        if (!cli_find_router(tokens[0], &router)) {
+            printf("Unknown router: %s\n", tokens[0]);
+            return true;
+        }
+
+        router_print_routes(router);
         return true;
     } else if (strcmp(tokens[0], "help") == 0){
         print_help();
