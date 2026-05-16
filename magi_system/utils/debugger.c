@@ -9,6 +9,10 @@
 #include "../layer4/udp.h"
 #include "../layer4/tcp.h"
 #include "../layer4/tcp_socket.h"
+#include "../layer7/magi_socket.h"
+#include "../layer7/dhcp_server.h"
+#include "../layer7/dns_server.h"
+#include "../layer7/http_server.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -1618,20 +1622,440 @@ void debug_milestone_3(Simulator *sim)
 
 // ==================== MILESTONE 4: APPLICATION LAYER ====================
 
+// Helper: create a host with IP for M4 tests
+static Host* m4_create_host(Simulator* sim, const char* name, uint8_t a, uint8_t b, uint8_t c, uint8_t d)
+{
+    int idx;
+    uint8_t octets[] = {a, b, c, d};
+
+    simulator_create_node(sim, "host", name, 1);
+    idx = simulator_find_node(sim, name);
+    if (idx < 0) return NULL;
+
+    Host* h = (Host*)sim->nodes[idx].node;
+    h->ip_address = ip_init(octets, 24);
+    h->has_ip = true;
+    return h;
+}
+
 void debug_milestone_4(Simulator *sim)
 {
-    (void)sim;
     test_reset();
     test_report_header("Milestone 4: Application Layer (Socket API, DHCP, DNS, HTTP)");
 
-    printf("\n" ANSI_YELLOW "  --- FEATURE NOT YET IMPLEMENTED ---\n" ANSI_RESET);
-    printf("  Planned tests for Milestone 4:\n");
-    printf("    - MagiSocket API (bind, listen, accept, connect, send, recv, close)\n");
-    printf("    - DHCP DORA (Discover, Offer, Request, Acknowledge)\n");
-    printf("    - DNS domain name resolution\n");
-    printf("    - HTTP GET request / response\n");
-    printf("    - HTTP server (start/stop)\n\n");
+    simulator_clear(sim);
 
+    uint8_t ip_a[] = {192, 168, 1, 10};
+    uint8_t ip_b[] = {10, 0, 0, 5};
+    uint8_t ip_c[] = {192, 168, 1, 1};
+    IpAddress src_ip = ip_init(ip_a, 24);
+    IpAddress dst_ip = ip_init(ip_b, 8); (void)dst_ip;
+    IpAddress server_ip = ip_init(ip_c, 24);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- MagiSocket API Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T1: Create socket
+    int sockfd = magi_socket(AF_INET, SOCK_STREAM);
+    TEST_MSG("magi_socket() creates TCP socket", sockfd >= 0, "got %d", sockfd);
+
+    // T2: Bind socket
+    int r = magi_bind(sockfd, &src_ip, 8080);
+    TEST("magi_bind() succeeds", r == 1);
+
+    // T3: Cannot listen without host attachment
+    r = magi_listen(sockfd, 5);
+    TEST("magi_listen() without host fails", r < 0);
+
+    // T4: Create UDP socket
+    int udp_sock = magi_socket(AF_INET, SOCK_DGRAM);
+    TEST_MSG("magi_socket() creates UDP socket", udp_sock >= 0, "got %d", udp_sock);
+
+    // T5: Close sockets
+    r = magi_close(sockfd);
+    TEST("magi_close() TCP socket", r == 1);
+    r = magi_close(udp_sock);
+    TEST("magi_close() UDP socket", r == 1);
+
+    // T6: MagiSocket with host attachment (end-to-end)
+    Host* h1 = m4_create_host(sim, "H1", 192, 168, 1, 10);
+    TEST("M4: Created H1", h1 != NULL);
+
+    if (h1) {
+        int asock = magi_socket(AF_INET, SOCK_STREAM);
+        TEST_MSG("M4: create connected socket", asock >= 0, "got %d", asock);
+        if (asock >= 0) {
+            magi_socket_attach_host(asock, h1);
+            magi_bind(asock, &h1->ip_address, 9090);
+            r = magi_listen(asock, 5);
+            TEST("M4: listen on host-attached socket", r == 1);
+            magi_close(asock);
+        }
+    }
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- DHCP Protocol Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T7: DHCP init
+    dhcp_server_init();
+    dhcp_server_set_ip(&server_ip);
+    TEST("DHCP server initialized", 1);
+
+    // T8: Create DHCP Discover
+    DHCPMessage discover;
+    uint8_t test_mac[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+    r = dhcp_create_discover(&discover, 0x1234, test_mac);
+    TEST("DHCP create DISCOVER", r == 1);
+    TEST("DHCP DISCOVER op = BOOTREQUEST", discover.op == DHCP_BOOTREQUEST);
+    TEST_MSG("DHCP DISCOVER xid = 0x1234", discover.xid == 0x1234, "got 0x%04X", discover.xid);
+
+    // T9: DISCOVER message type
+    int msg_type = dhcp_get_msg_type(&discover);
+    TEST_MSG("DHCP DISCOVER message type = 1", msg_type == DHCP_DISCOVER, "got %d", msg_type);
+
+    // T10: DHCP serialize/deserialize roundtrip
+    uint8_t dhcp_raw[DHCP_HEADER_SIZE + DHCP_OPTIONS_SIZE];
+    int dhcp_len = dhcp_message_to_bytes(&discover, dhcp_raw, sizeof(dhcp_raw));
+    TEST_MSG("DHCP to_bytes length", dhcp_len > 0, "got %d", dhcp_len);
+
+    DHCPMessage discover2;
+    r = dhcp_message_from_bytes(&discover2, dhcp_raw, (size_t)dhcp_len);
+    TEST("DHCP from_bytes", r == 1);
+    TEST("DHCP roundtrip op", discover2.op == DHCP_BOOTREQUEST);
+    TEST("DHCP roundtrip xid", discover2.xid == 0x1234);
+
+    // T11: DHCP DISCOVER -> OFFER
+    DHCPMessage offer;
+    r = dhcp_server_handle_discover(&discover, &offer);
+    TEST("DHCP handle DISCOVER -> OFFER", r == 1);
+    msg_type = dhcp_get_msg_type(&offer);
+    TEST_MSG("DHCP OFFER message type = 2", msg_type == DHCP_OFFER, "got %d", msg_type);
+    TEST("DHCP OFFER op = BOOTREPLY", offer.op == DHCP_BOOTREPLY);
+    TEST("DHCP OFFER has yiaddr", offer.yiaddr.octet[3] > 0);
+
+    // T12: DHCP client receives OFFER -> creates REQUEST
+    DHCPMessage request;
+    r = dhcp_create_request(&request, 0x1234, test_mac, &offer.yiaddr, &server_ip);
+    TEST("DHCP create REQUEST", r == 1);
+    msg_type = dhcp_get_msg_type(&request);
+    TEST_MSG("DHCP REQUEST message type = 3", msg_type == DHCP_REQUEST, "got %d", msg_type);
+
+    // T13: DHCP REQUEST -> ACK
+    DHCPMessage ack;
+    r = dhcp_server_handle_request(&request, &ack);
+    TEST("DHCP handle REQUEST -> ACK", r == 1);
+    msg_type = dhcp_get_msg_type(&ack);
+    TEST_MSG("DHCP ACK message type = 5", msg_type == DHCP_ACK, "got %d", msg_type);
+    TEST("DHCP ACK yiaddr matches request",
+         ip_octets_equal_public(&ack.yiaddr, &offer.yiaddr));
+
+    // T14: DHCP get lease
+    IpAddress leased_ip;
+    r = dhcp_get_lease(test_mac, &leased_ip);
+    TEST("DHCP get lease for MAC", r == 1);
+    TEST("DHCP leased IP matches offered",
+         ip_octets_equal_public(&leased_ip, &offer.yiaddr));
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- DNS Protocol Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T15: DNS init
+    dns_server_init();
+    TEST("DNS server initialized with default entries", 1);
+
+    // T16: DNS resolve
+    IpAddress resolved;
+    r = dns_server_resolve("www.magi.com", &resolved);
+    TEST("DNS resolve www.magi.com", r == 1);
+    TEST_MSG("DNS resolved to 10.0.0.5",
+             resolved.octet[0] == 10 && resolved.octet[3] == 5,
+             "got %d.%d.%d.%d", resolved.octet[0], resolved.octet[1], resolved.octet[2], resolved.octet[3]);
+
+    // T17: DNS resolve unknown
+    r = dns_server_resolve("unknown.example.com", &resolved);
+    TEST("DNS resolve unknown returns 0", r == 0);
+
+    // T18: DNS add custom entry
+    uint8_t custom_ip[] = {172, 16, 0, 1};
+    IpAddress custom_addr = ip_init(custom_ip, 0);
+    dns_server_add_entry("custom.test", &custom_addr);
+    r = dns_server_resolve("custom.test", &resolved);
+    TEST("DNS resolve custom.test", r == 1);
+    TEST_MSG("DNS custom -> 172.16.0.1",
+             resolved.octet[0] == 172 && resolved.octet[3] == 1,
+             "got %d.%d.%d.%d", resolved.octet[0], resolved.octet[1], resolved.octet[2], resolved.octet[3]);
+
+    // T19: DNS add duplicate entry (should update)
+    uint8_t custom_ip2[] = {172, 16, 0, 2};
+    IpAddress custom_addr2 = ip_init(custom_ip2, 0);
+    dns_server_add_entry("custom.test", &custom_addr2);
+    r = dns_server_resolve("custom.test", &resolved);
+    TEST_MSG("DNS updated custom.test -> 172.16.0.2",
+             resolved.octet[3] == 2,
+             "got %d.%d.%d.%d", resolved.octet[0], resolved.octet[1], resolved.octet[2], resolved.octet[3]);
+
+    // T20: DNS query/response serialization
+    uint8_t dns_query[512];
+    size_t query_len;
+    r = dns_create_query(dns_query, sizeof(dns_query), &query_len, 0xAAAA, "www.magi.com");
+    TEST("DNS create query", r == 1);
+    TEST_MSG("DNS query length", query_len > 12, "got %zu", query_len);
+
+    // T21: DNS handle query -> response
+    uint8_t dns_response[512];
+    size_t resp_len;
+    r = dns_server_handle_query(dns_query, query_len, dns_response, &resp_len, sizeof(dns_response));
+    TEST("DNS handle query", r == 1);
+    TEST_MSG("DNS response length", resp_len > 12, "got %zu", resp_len);
+
+    // T22: Parse DNS response
+    IpAddress dns_resolved;
+    r = dns_parse_response(dns_response, resp_len, &dns_resolved);
+    TEST("DNS parse response for IP", r == 1);
+    TEST_MSG("DNS response IP = 10.0.0.5",
+             dns_resolved.octet[0] == 10 && dns_resolved.octet[3] == 5,
+             "got %d.%d.%d.%d", dns_resolved.octet[0], dns_resolved.octet[1], dns_resolved.octet[2], dns_resolved.octet[3]);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- HTTP Protocol Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T23: HTTP init
+    http_server_init();
+    TEST("HTTP server initialized", !http_server_is_running());
+
+    // T24: HTTP server start/stop
+    r = http_server_start(&server_ip, NULL);
+    TEST("HTTP server start", r == 1);
+    TEST("HTTP server is running", http_server_is_running());
+
+    r = http_server_stop();
+    TEST("HTTP server stop", r == 1);
+    TEST("HTTP server not running after stop", !http_server_is_running());
+
+    // T25: HTTP start again (idempotent)
+    r = http_server_start(&server_ip, "/var/www");
+    TEST("HTTP server re-start", r == 1);
+
+    // T26: Parse HTTP GET request
+    char method[16], path[256];
+    r = http_parse_request("GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n", 50,
+                            method, sizeof(method), path, sizeof(path));
+    TEST("HTTP parse GET request", r == 1);
+    TEST_MSG("HTTP method = GET", strcmp(method, "GET") == 0, "got '%s'", method);
+    TEST_MSG("HTTP path = /index.html", strcmp(path, "/index.html") == 0, "got '%s'", path);
+
+    // T27: Parse HTTP Head request
+    r = http_parse_request("HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n", 38,
+                            method, sizeof(method), path, sizeof(path));
+    TEST("HTTP parse HEAD request", r == 1);
+    TEST_MSG("HTTP method = HEAD", strcmp(method, "HEAD") == 0, "got '%s'", method);
+
+    // T28: Build HTTP response
+    char response[4096];
+    resp_len = 0;
+    r = http_build_response(200, "OK", "text/html",
+                             "<html><body><h1>OK</h1></body></html>", 40,
+                             response, &resp_len, sizeof(response));
+    TEST("HTTP build 200 response", r == 1);
+    TEST_MSG("HTTP response contains 200", strstr(response, "200 OK") != NULL,
+             "got: %s", response);
+    TEST_MSG("HTTP response has Content-Length",
+             strstr(response, "Content-Length: 40") != NULL,
+             "got: %s", response);
+
+    // T29: Build 404 response
+    resp_len = 0;
+    r = http_build_response(404, "Not Found", "text/plain",
+                             "404 Not Found", 13,
+                             response, &resp_len, sizeof(response));
+    TEST("HTTP build 404 response", r == 1);
+    TEST("HTTP 404 contains 'Not Found'", strstr(response, "404 Not Found") != NULL);
+
+    // T30: HTTP serve default page
+    resp_len = 0;
+    r = http_serve_default("/", response, &resp_len, sizeof(response));
+    TEST("HTTP serve default page", r == 1);
+    TEST("HTTP default page contains 200 OK", strstr(response, "200 OK") != NULL);
+    TEST("HTTP default page contains HTML", strstr(response, "<!DOCTYPE html>") != NULL);
+    TEST("HTTP default page contains Welcome", strstr(response, "Welcome to Magi System") != NULL);
+
+    // T31: HTTP handle full request
+    resp_len = 0;
+    r = http_server_handle_request("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", 40,
+                                    response, &resp_len, sizeof(response));
+    TEST("HTTP handle GET request", r == 1);
+    TEST("HTTP response from handler contains 200 OK", strstr(response, "200 OK") != NULL);
+
+    // T32: HTTP handle invalid request -> 400
+    resp_len = 0;
+    r = http_server_handle_request("INVALID\r\n", 9, response, &resp_len, sizeof(response));
+    TEST("HTTP handle invalid request -> 400", r == 1);
+    TEST("HTTP 400 response", strstr(response, "400") != NULL);
+
+    // T33: HTTP handle unsupported method -> 405
+    resp_len = 0;
+    r = http_server_handle_request("POST / HTTP/1.1\r\nHost: localhost\r\n\r\n", 40,
+                                    response, &resp_len, sizeof(response));
+    TEST("HTTP handle POST -> 405", r == 1);
+    TEST("HTTP 405 response", strstr(response, "405") != NULL);
+
+    // T34: HTTP server stop
+    http_server_stop();
+    TEST("HTTP server stopped after tests", !http_server_is_running());
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- MagiSocket Integration Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T35: Create host with MagiSocket infrastructure
+    Host* h2 = m4_create_host(sim, "H2", 192, 168, 1, 20);
+    TEST("M4: Created H2", h2 != NULL);
+
+    if (h1 && h2) {
+        // T36: Two sockets, each attached to different hosts
+        int s1 = magi_socket(AF_INET, SOCK_STREAM);
+        int s2 = magi_socket(AF_INET, SOCK_STREAM);
+        TEST("M4: Create two sockets", s1 >= 0 && s2 >= 0);
+
+        if (s1 >= 0 && s2 >= 0) {
+            // Attach to hosts
+            magi_socket_attach_host(s1, h1);
+            magi_socket_attach_host(s2, h2);
+
+            // Set up H2 as a listening server
+            magi_bind(s2, &h2->ip_address, 80);
+            r = magi_listen(s2, 5);
+            TEST("M4: H2 listens on port 80", r == 1);
+
+            // Try H1 connecting to H2
+            magi_bind(s1, &h1->ip_address, 12345);
+            r = magi_connect(s1, &h2->ip_address, 80);
+            TEST("M4: H1 connects to H2:80", r == 1);
+
+            // Clean up
+            magi_close(s1);
+            magi_close(s2);
+        }
+    }
+
+    // T37: DNS with MagiSocket resolve helper
+    IpAddress res;
+    r = magi_resolve("www.magi.com", &res);
+    TEST("M4: magi_resolve www.magi.com", r == 1);
+    TEST_MSG("M4: resolved to 10.0.0.5",
+             res.octet[0] == 10 && res.octet[3] == 5,
+             "got %d.%d.%d.%d", res.octet[0], res.octet[1], res.octet[2], res.octet[3]);
+
+    // T38: Resolve direct IP (pass-through)
+    r = magi_resolve("192.168.1.1", &res);
+    TEST("M4: magi_resolve direct IP", r == 1);
+    TEST_MSG("M4: resolved 192.168.1.1",
+             res.octet[0] == 192 && res.octet[3] == 1,
+             "got %d.%d.%d.%d", res.octet[0], res.octet[1], res.octet[2], res.octet[3]);
+
+    // T39: DNS query with hostname containing http:// prefix
+    r = dns_server_resolve("http://www.magi.com", &res);
+    TEST("M4: DNS resolve with http:// prefix", r == 1);
+    TEST_MSG("M4: resolved to 10.0.0.5",
+             res.octet[0] == 10 && res.octet[3] == 5,
+             "got %d.%d.%d.%d", res.octet[0], res.octet[1], res.octet[2], res.octet[3]);
+
+    // T40: DNS query with trailing path
+    r = dns_server_resolve("www.magi.com/index.html", &res);
+    TEST("M4: DNS resolve with trailing path", r == 1);
+    TEST_MSG("M4: resolved to 10.0.0.5",
+             res.octet[0] == 10 && res.octet[3] == 5,
+             "got %d.%d.%d.%d", res.octet[0], res.octet[1], res.octet[2], res.octet[3]);
+
+    // T41: HTTP server double stop (idempotent)
+    http_server_stop();
+    http_server_stop();
+    TEST("M4: HTTP server double stop is safe", !http_server_is_running());
+
+    // T42: HTTP content type in response
+    http_server_start(&server_ip, NULL);
+    resp_len = 0;
+    http_serve_default("/", response, &resp_len, sizeof(response));
+    TEST("M4: HTTP default page has Content-Type",
+         strstr(response, "Content-Type: text/html") != NULL);
+    http_server_stop();
+
+    // T43: DHCP OFFER with proper options
+    // Re-init DHCP and create a new offer
+    dhcp_server_init();
+    dhcp_server_set_ip(&server_ip);
+    uint8_t mac2[6] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+
+    DHCPMessage discover3;
+    dhcp_create_discover(&discover3, 0x5678, mac2);
+    DHCPMessage offer3;
+    dhcp_server_handle_discover(&discover3, &offer3);
+    TEST("M4: DHCP OFFER has magic cookie", offer3.magic_cookie == DHCP_MAGIC_COOKIE);
+    TEST("M4: DHCP OFFER has yiaddr != 0",
+         offer3.yiaddr.octet[0] > 0 || offer3.yiaddr.octet[3] > 0);
+
+    // T44: DHCP ACK yiaddr matches offered
+    DHCPMessage req3;
+    dhcp_create_request(&req3, 0x5678, mac2, &offer3.yiaddr, &server_ip);
+    DHCPMessage ack3;
+    dhcp_server_handle_request(&req3, &ack3);
+    TEST("M4: DHCP ACK yiaddr == OFFER yiaddr",
+         ip_octets_equal_public(&ack3.yiaddr, &offer3.yiaddr));
+
+    // T45: HTTP GET request string building
+    char get_request[256];
+    int get_len = snprintf(get_request, sizeof(get_request),
+                           "GET / HTTP/1.1\r\n"
+                           "Host: www.magi.com\r\n"
+                           "User-Agent: MagiSystem/1.0\r\n"
+                           "Accept: */*\r\n"
+                           "Connection: close\r\n"
+                           "\r\n");
+    TEST("M4: HTTP GET request built", get_len > 0);
+    TEST("M4: HTTP GET contains Host header",
+         strstr(get_request, "Host: www.magi.com") != NULL);
+
+    // T46: HTTP GET response with proper headers
+    http_server_start(&server_ip, NULL);
+    resp_len = 0;
+    http_server_handle_request(get_request, (size_t)get_len,
+                                response, &resp_len, sizeof(response));
+    TEST("M4: HTTP GET response has Server header",
+         strstr(response, "Server: MagiSystem/1.0") != NULL);
+    TEST("M4: HTTP GET response has Connection: close",
+         strstr(response, "Connection: close") != NULL);
+    http_server_stop();
+
+    // T47: DHCP serialization - verify header fields
+    DHCPMessage msg;
+    dhcp_create_discover(&msg, 0xABCD, test_mac);
+    TEST("M4: DHCP htype = 1 (Ethernet)", msg.htype == 1);
+    TEST("M4: DHCP hlen = 6 (MAC length)", msg.hlen == 6);
+
+    // T48: Verify chaddr preserved in DHCP messages
+    TEST("M4: DHCP chaddr preserved",
+         memcmp(msg.chaddr, test_mac, 6) == 0);
+
+    // T49: DNS serialization - verify header fields in query
+    uint8_t dns_q[512];
+    size_t dns_q_len;
+    dns_create_query(dns_q, sizeof(dns_q), &dns_q_len, 0x1234, "test.example.com");
+    TEST("M4: DNS query ID = 0x1234",
+         (dns_q[0] == 0x12 && dns_q[1] == 0x34));
+    TEST("M4: DNS query has RD flag", (dns_q[2] & 0x01) == 0x01);
+    TEST("M4: DNS query QDCOUNT = 1",
+         (dns_q[4] == 0 && dns_q[5] == 1));
+
+    // T50: HTTP parse with empty path
+    r = http_parse_request("GET  HTTP/1.1\r\n", 16,
+                            method, sizeof(method), path, sizeof(path));
+    TEST("M4: HTTP parse with empty path fails", r == 0);
+
+    simulator_clear(sim);
     test_report_footer();
 }
 

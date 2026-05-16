@@ -45,6 +45,9 @@ typedef struct Host{
     TCPSegment last_tcp;
     bool has_last_tcp;
     bool tcp_data_ready;
+
+    // Application Layer (Milestone 4) - MagiSocket fd
+    int magi_sock_fd;
 }Host;
 
 void host_init(Host* host, int num_interfaces);

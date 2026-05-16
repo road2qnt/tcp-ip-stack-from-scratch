@@ -7,6 +7,10 @@
 #include "../layer3/icmp.h"
 #include "../layer4/udp.h"
 #include "../layer4/tcp.h"
+#include "../layer7/magi_socket.h"
+#include "../layer7/dhcp_server.h"
+#include "../layer7/dns_server.h"
+#include "../layer7/http_server.h"
 
 #define MAX_COMMAND_LENGTH 100
 
@@ -31,6 +35,15 @@ static void print_help(void)
     printf("  <host> tcp_close\n");
     printf("  <host> udp_send <ip> <dstport> <data>\n");
     printf("  <host> tcp_status\n");
+    printf("  <host> magi_sock_connect <ip> <port>\n");
+    printf("  <host> magi_sock_send <data>\n");
+    printf("  <host> magi_sock_recv\n");
+    printf("  <host> magi_sock_close\n");
+    printf("  <host> dhcp_discover\n");
+    printf("  <host> dns_resolve <hostname>\n");
+    printf("  <host> http_get <url>\n");
+    printf("  <host> http_server start [dir]\n");
+    printf("  <host> http_server stop\n");
     printf("  exit | quit\n");
 }
 
@@ -605,6 +618,296 @@ bool process(char* command){
         }
 
         return true;
+    } else if (count >= 2 && strcmp(tokens[1], "magi_sock_connect") == 0) {
+        // <host> magi_sock_connect <ip> <port>
+        Host* host;
+        IpAddress target_ip;
+
+        if (count < 4) {
+            printf("Usage: <host> magi_sock_connect <ip> <port>\n");
+            return true;
+        }
+
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+        if (!ip_parse(tokens[2], &target_ip)) {
+            printf("Invalid IP: %s\n", tokens[2]);
+            return true;
+        }
+
+        int port = atoi(tokens[3]);
+        if (port <= 0 || port > 65535) {
+            printf("Invalid port: %d\n", port);
+            return true;
+        }
+
+        int sockfd = magi_socket(AF_INET, SOCK_STREAM);
+        if (sockfd < 0) {
+            printf("[%s] Failed to create MagiSocket\n", host->base.NAME);
+            return true;
+        }
+
+        magi_socket_attach_host(sockfd, host);
+        magi_connect(sockfd, &target_ip, (uint16_t)port);
+        host->magi_sock_fd = sockfd;
+
+        char ip_buf[20];
+        ip_to_string(&target_ip, ip_buf, sizeof(ip_buf), false);
+        printf("[%s] MagiSocket connected to %s:%d (fd=%d)\n",
+               host->base.NAME, ip_buf, port, sockfd);
+        return true;
+
+    } else if (count >= 2 && strcmp(tokens[1], "magi_sock_send") == 0) {
+        Host* host;
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+        if (count < 3) {
+            printf("Usage: <host> magi_sock_send <data>\n");
+            return true;
+        }
+        int r = magi_send(host->magi_sock_fd, (const uint8_t*)tokens[2], strlen(tokens[2]));
+        if (r > 0) {
+            printf("[%s] Sent %d bytes\n", host->base.NAME, r);
+        } else {
+            printf("[%s] Failed to send data\n", host->base.NAME);
+        }
+        return true;
+
+    } else if (count >= 2 && strcmp(tokens[1], "magi_sock_recv") == 0) {
+        Host* host;
+        uint8_t buf[MAGI_SOCKET_BUFFER_SIZE];
+
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+
+        int r = magi_recv(host->magi_sock_fd, buf, sizeof(buf) - 1);
+        if (r > 0) {
+            buf[r] = '\0';
+            printf("[%s] Received %d bytes: %s\n", host->base.NAME, r, (char*)buf);
+        } else {
+            printf("[%s] No data available\n", host->base.NAME);
+        }
+        return true;
+
+    } else if (count >= 2 && strcmp(tokens[1], "magi_sock_close") == 0) {
+        Host* host;
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+        magi_close(host->magi_sock_fd);
+        host->magi_sock_fd = -1;
+        printf("[%s] MagiSocket closed\n", host->base.NAME);
+        return true;
+
+    } else if (count >= 2 && strcmp(tokens[1], "dhcp_discover") == 0) {
+        // <host> dhcp_discover
+        Host* host;
+        DHCPMessage discover;
+        uint8_t dhcp_raw[DHCP_HEADER_SIZE + DHCP_OPTIONS_SIZE];
+        size_t dhcp_len;
+        uint32_t xid = (uint32_t)(rand() % 100000);
+
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+
+        if (!host->has_ip) {
+            printf("[DHCP] %s has no IP, using 0.0.0.0\n", host->base.NAME);
+        }
+
+        printf("[%s] DHCP Discover (xid=%u)...\n", host->base.NAME, xid);
+
+        // Create discover message
+        dhcp_create_discover(&discover, xid, host->base.interfaces[0].Mac_Address.bytes);
+
+        dhcp_len = dhcp_message_to_bytes(&discover, dhcp_raw, sizeof(dhcp_raw));
+        if (dhcp_len == 0) {
+            printf("[DHCP] Failed to serialize discover\n");
+            return true;
+        }
+
+        // Send as UDP to port 67 (broadcast)
+        IpAddress broadcast_ip;
+        uint8_t bcast[] = {255, 255, 255, 255};
+        broadcast_ip = ip_init(bcast, 0);
+
+        UDPDatagram udp;
+        udp_init(&udp);
+        udp_create(&udp, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, dhcp_raw, dhcp_len);
+
+        uint8_t udp_raw[UDP_HEADER_SIZE + UDP_MAX_PAYLOAD];
+        size_t udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
+        if (udp_len > 0) {
+            IpAddress src_ip = host->has_ip ? host->ip_address : broadcast_ip;
+            udp.checksum = udp_compute_checksum(udp_raw, udp_len, &src_ip, &broadcast_ip);
+            udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
+
+            uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
+            IPv4Packet ip_pkt;
+            if (ipv4_create(&ip_pkt, src_ip, broadcast_ip,
+                            IPV4_DEFAULT_TTL, IPV4_PROTOCOL_UDP, udp_raw, udp_len)) {
+                size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
+                if (ip_len > 0) {
+                    host_send_l3_packet(host, &broadcast_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
+                    printf("[%s] DHCP Discover broadcast sent\n", host->base.NAME);
+                }
+            }
+        }
+
+        return true;
+
+    } else if (count >= 2 && strcmp(tokens[1], "dns_resolve") == 0) {
+        // <host> dns_resolve <hostname>
+        IpAddress resolved;
+
+        if (count < 3) {
+            printf("Usage: <host> dns_resolve <hostname>\n");
+            return true;
+        }
+
+        if (dns_server_resolve(tokens[2], &resolved)) {
+            char ip_buf[20];
+            ip_to_string(&resolved, ip_buf, sizeof(ip_buf), false);
+            printf("[DNS] %s -> %s\n", tokens[2], ip_buf);
+        } else {
+            printf("[DNS] Could not resolve: %s\n", tokens[2]);
+        }
+
+        return true;
+
+    } else if (count >= 2 && strcmp(tokens[1], "http_get") == 0) {
+        // <host> http_get <url>
+        Host* host;
+        char hostname[256];
+        char path[512];
+        IpAddress resolved;
+
+        if (count < 3) {
+            printf("Usage: <host> http_get <url>\n");
+            printf("Examples:\n");
+            printf("  H1 http_get www.magi.com\n");
+            printf("  H1 http_get www.magi.com/index.html\n");
+            return true;
+        }
+
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+
+        // Parse URL into hostname and path
+        const char* url = tokens[2];
+        const char* h = url;
+        if (strncmp(h, "http://", 7) == 0) h += 7;
+
+        // Extract hostname
+        const char* slash = strchr(h, '/');
+        if (slash) {
+            size_t host_len = (size_t)(slash - h);
+            if (host_len >= sizeof(hostname)) host_len = sizeof(hostname) - 1;
+            strncpy(hostname, h, host_len);
+            hostname[host_len] = '\0';
+            strncpy(path, slash, sizeof(path) - 1);
+            path[sizeof(path) - 1] = '\0';
+        } else {
+            strncpy(hostname, h, sizeof(hostname) - 1);
+            hostname[sizeof(hostname) - 1] = '\0';
+            strncpy(path, "/", sizeof(path) - 1);
+        }
+
+        // Resolve hostname
+        if (!dns_server_resolve(hostname, &resolved)) {
+            // Try as IP
+            if (!ip_parse(hostname, &resolved)) {
+                printf("[HTTP] Could not resolve hostname: %s\n", hostname);
+                return true;
+            }
+        }
+
+        char ip_buf[20];
+        ip_to_string(&resolved, ip_buf, sizeof(ip_buf), false);
+        printf("[HTTP] Resolved %s -> %s\n", hostname, ip_buf);
+
+        // Create MagiSocket and connect
+        int sockfd = magi_socket(AF_INET, SOCK_STREAM);
+        if (sockfd < 0) {
+            printf("[%s] Failed to create socket\n", host->base.NAME);
+            return true;
+        }
+
+        magi_socket_attach_host(sockfd, host);
+        magi_connect(sockfd, &resolved, HTTP_SERVER_PORT);
+
+        // Build HTTP GET request
+        char request[1024];
+        int req_len = snprintf(request, sizeof(request),
+                               "GET %s HTTP/1.1\r\n"
+                               "Host: %s\r\n"
+                               "User-Agent: MagiSystem/1.0\r\n"
+                               "Accept: */*\r\n"
+                               "Connection: close\r\n"
+                               "\r\n",
+                               path, hostname);
+
+        if (req_len > 0) {
+            magi_send(sockfd, (const uint8_t*)request, (size_t)req_len);
+            printf("[HTTP] GET %s -> %s:%d\n", path, ip_buf, HTTP_SERVER_PORT);
+        }
+
+        // If HTTP server is running on target, handle it
+        if (http_server_is_running()) {
+            char response[HTTP_BUFFER_SIZE];
+            size_t resp_len = 0;
+
+            if (http_server_handle_request(request, (size_t)req_len,
+                                            response, &resp_len, sizeof(response))) {
+                printf("\n=== HTTP Response ===\n");
+                fwrite(response, 1, resp_len > 512 ? 512 : resp_len, stdout);
+                printf("...\n=== End ===\n\n");
+            }
+        }
+
+        magi_close(sockfd);
+        return true;
+
+    } else if (count >= 2 && strcmp(tokens[1], "http_server") == 0) {
+        // <host> http_server start|stop [dir]
+        if (count < 3) {
+            printf("Usage: <host> http_server start [dir]\n");
+            printf("       <host> http_server stop\n");
+            return true;
+        }
+
+        if (strcmp(tokens[2], "start") == 0) {
+            Host* host;
+            if (!cli_find_host(tokens[0], &host)) {
+                printf("Unknown host: %s\n", tokens[0]);
+                return true;
+            }
+
+            const char* root_dir = count >= 4 ? tokens[3] : NULL;
+            http_server_start(&host->ip_address, root_dir);
+            printf("[HTTP] Server started on %s:80\n", tokens[0]);
+        } else if (strcmp(tokens[2], "stop") == 0) {
+            if (http_server_stop()) {
+                printf("[HTTP] Server stopped\n");
+            } else {
+                printf("[HTTP] No server running\n");
+            }
+        } else {
+            printf("Unknown http_server subcommand: %s\n", tokens[2]);
+        }
+
+        return true;
+
     } else if (count >= 3 && strcmp(tokens[1], "udp_send") == 0) {
         // <host> udp_send <ip> <dstport> <data>
         Host* host;

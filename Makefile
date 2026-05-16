@@ -24,7 +24,12 @@ SRCS := \
 	magi_system/utils/json.c \
 	magi_system/utils/loader.c \
 	magi_system/utils/visualizer.c \
-	magi_system/utils/debugger.c
+	magi_system/utils/debugger.c \
+	magi_system/layer7/magi_socket.c \
+	magi_system/layer7/dhcp_server.c \
+	magi_system/layer7/dns_server.c \
+	magi_system/layer7/http_server.c \
+	magi_system/layer7/rip.c
 
 .PHONY: run build clean
 

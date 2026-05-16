@@ -443,6 +443,7 @@ void host_init_with_macs(Host* host, int num_interfaces, const MacAddress* mac_a
     arp_table_init(&host->arp_table);
     host_pending_queue_init(&host->pending_queue);
     tcp_socket_init(host->tcp_sockets, TCP_MAX_SOCKETS);
+    host->magi_sock_fd = -1;
 }
 
 void host_pending_queue_init(HostPendingQueue* queue)
