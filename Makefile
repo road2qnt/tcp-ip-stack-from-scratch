@@ -1,6 +1,20 @@
 CC := gcc
 CFLAGS := -Wall -Wextra -std=c11 -I./magi_system
 TARGET := magi_system.out
+SDL_CFLAGS := $(shell pkg-config --cflags sdl2 2>/dev/null)
+SDL_LIBS := $(shell pkg-config --libs sdl2 2>/dev/null)
+
+# Build with GUI support if SDL2 is available
+ifneq ($(SDL_LIBS),)
+    CFLAGS += $(SDL_CFLAGS) -DHAS_SDL
+    GUI_SRCS := magi_system/gui/app.c
+    GUI_OBJS := magi_system/gui/app.o
+    LIBS := $(SDL_LIBS) -lm
+else
+    GUI_SRCS :=
+    GUI_OBJS :=
+    LIBS :=
+endif
 
 SRCS := \
 	magi_system/main.c \
@@ -29,15 +43,24 @@ SRCS := \
 	magi_system/layer7/dhcp_server.c \
 	magi_system/layer7/dns_server.c \
 	magi_system/layer7/http_server.c \
-	magi_system/layer7/rip.c
+	magi_system/layer7/rip.c \
+	$(GUI_SRCS)
 
 .PHONY: run build clean
 
 run: build
 	./$(TARGET)
 
+gui: build
+	./$(TARGET) --gui
+
+
 build:
-	$(CC) $(CFLAGS) $(SRCS) -o $(TARGET)
+	$(CC) $(CFLAGS) $(SRCS) $(LIBS) -o $(TARGET)
+
+# Object file for gui (needs separate compilation for potential -MMD use)
+magi_system/gui/app.o: magi_system/gui/app.c magi_system/gui/app.h
+	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
 	rm -f $(TARGET)
