@@ -5,6 +5,8 @@
 #include "../layer2/host.h"
 #include "../layer3/router.h"
 #include "../layer3/icmp.h"
+#include "../layer4/udp.h"
+#include "../layer4/tcp.h"
 
 #define MAX_COMMAND_LENGTH 100
 
@@ -22,6 +24,13 @@ static void print_help(void)
     printf("  <host> ping <ip|host>\n");
     printf("  <host> traceroute <ip|host>\n");
     printf("  <router> route\n");
+    printf("  <host> tcp_connect <ip> <port>\n");
+    printf("  <host> tcp_listen <port>\n");
+    printf("  <host> tcp_send <data>\n");
+    printf("  <host> tcp_recv\n");
+    printf("  <host> tcp_close\n");
+    printf("  <host> udp_send <ip> <dstport> <data>\n");
+    printf("  <host> tcp_status\n");
     printf("  exit | quit\n");
 }
 
@@ -306,6 +315,355 @@ bool process(char* command){
         }
 
         router_print_routes(router);
+        return true;
+    } else if (count >= 2 && strcmp(tokens[1], "tcp_connect") == 0) {
+        // <host> tcp_connect <ip> <port>
+        Host* host;
+        IpAddress target_ip;
+
+        if (count < 4) {
+            printf("Usage: <host> tcp_connect <ip> <port>\n");
+            return true;
+        }
+
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+
+        if (!ip_parse(tokens[2], &target_ip)) {
+            printf("Invalid IP: %s\n", tokens[2]);
+            return true;
+        }
+
+        int dst_port = atoi(tokens[3]);
+        if (dst_port <= 0 || dst_port > 65535) {
+            printf("Invalid port: %d\n", dst_port);
+            return true;
+        }
+
+        // Allocate a TCP socket
+        int sock_idx = tcp_socket_alloc(host->tcp_sockets, TCP_MAX_SOCKETS);
+        if (sock_idx < 0) {
+            printf("[%s] No free TCP socket slots\n", host->base.NAME);
+            return true;
+        }
+
+        TCPSocket* sock = &host->tcp_sockets[sock_idx];
+        tcp_socket_connect(sock, &host->ip_address, (uint16_t)dst_port + 1000,
+                           &target_ip, (uint16_t)dst_port);
+
+        char ip_buf[20];
+        ip_to_string(&target_ip, ip_buf, sizeof(ip_buf), false);
+        printf("[%s] TCP connect initiated to %s:%d\n", host->base.NAME, ip_buf, dst_port);
+
+        // Build SYN packet
+        uint8_t tcp_raw[TCP_HEADER_SIZE];
+        TCPSegment syn_seg;
+        tcp_init(&syn_seg);
+        syn_seg.src_port = sock->local_port;
+        syn_seg.dst_port = sock->remote_port;
+        syn_seg.seq_num = sock->send_seq;
+        syn_seg.flags = TCP_FLAG_SYN;
+        syn_seg.window = TCP_WINDOW_SIZE;
+
+        size_t tcp_len = packet_to_bytes((Packet*)&syn_seg, tcp_raw, sizeof(tcp_raw));
+        if (tcp_len > 0) {
+            syn_seg.checksum = tcp_compute_checksum(tcp_raw, tcp_len,
+                                                     &sock->local_ip, &sock->remote_ip);
+            tcp_len = packet_to_bytes((Packet*)&syn_seg, tcp_raw, sizeof(tcp_raw));
+
+            uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
+            IPv4Packet ip_pkt;
+            if (ipv4_create(&ip_pkt, sock->local_ip, sock->remote_ip,
+                            IPV4_DEFAULT_TTL, IPV4_PROTOCOL_TCP, tcp_raw, tcp_len)) {
+                size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
+                if (ip_len > 0) {
+                    host_send_l3_packet(host, &sock->remote_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
+                }
+            }
+        }
+
+        return true;
+    } else if (count >= 2 && strcmp(tokens[1], "tcp_listen") == 0) {
+        // <host> tcp_listen <port>
+        Host* host;
+
+        if (count < 3) {
+            printf("Usage: <host> tcp_listen <port>\n");
+            return true;
+        }
+
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+
+        int port = atoi(tokens[2]);
+        if (port <= 0 || port > 65535) {
+            printf("Invalid port: %d\n", port);
+            return true;
+        }
+
+        int sock_idx = tcp_socket_alloc(host->tcp_sockets, TCP_MAX_SOCKETS);
+        if (sock_idx < 0) {
+            printf("[%s] No free TCP socket slots\n", host->base.NAME);
+            return true;
+        }
+
+        TCPSocket* sock = &host->tcp_sockets[sock_idx];
+        tcp_socket_listen(sock, &host->ip_address, (uint16_t)port);
+
+        return true;
+    } else if (count >= 2 && strcmp(tokens[1], "tcp_send") == 0) {
+        // <host> tcp_send <data>
+        Host* host;
+
+        if (count < 3) {
+            printf("Usage: <host> tcp_send <data>\n");
+            return true;
+        }
+
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+
+        // Find first ESTABLISHED socket on this host
+        TCPSocket* sock = NULL;
+        for (int i = 0; i < TCP_MAX_SOCKETS; i++) {
+            if (host->tcp_sockets[i].in_use &&
+                host->tcp_sockets[i].state == TCP_ESTABLISHED) {
+                sock = &host->tcp_sockets[i];
+                break;
+            }
+        }
+
+        if (sock == NULL) {
+            printf("[%s] No established TCP connection\n", host->base.NAME);
+            return true;
+        }
+
+        const char* data = tokens[2];
+        size_t data_len = strlen(data);
+
+        if (data_len > TCP_MAX_PAYLOAD) {
+            data_len = TCP_MAX_PAYLOAD;
+        }
+
+        tcp_socket_send(sock, (const uint8_t*)data, data_len);
+
+        // Send data packet
+        uint8_t tcp_raw[TCP_HEADER_SIZE + TCP_MAX_PAYLOAD];
+        TCPSegment data_seg;
+        tcp_init(&data_seg);
+        data_seg.src_port = sock->local_port;
+        data_seg.dst_port = sock->remote_port;
+        data_seg.seq_num = sock->send_seq;
+        data_seg.ack_num = sock->recv_seq;
+        data_seg.flags = TCP_FLAG_ACK | TCP_FLAG_PSH;
+        data_seg.window = TCP_WINDOW_SIZE;
+        data_seg.payload_len = data_len;
+        memcpy(data_seg.payload, data, data_len);
+
+        size_t tcp_len = packet_to_bytes((Packet*)&data_seg, tcp_raw, sizeof(tcp_raw));
+        if (tcp_len > 0) {
+            data_seg.checksum = tcp_compute_checksum(tcp_raw, tcp_len,
+                                                     &sock->local_ip, &sock->remote_ip);
+            tcp_len = packet_to_bytes((Packet*)&data_seg, tcp_raw, sizeof(tcp_raw));
+
+            uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
+            IPv4Packet ip_pkt;
+            if (ipv4_create(&ip_pkt, sock->local_ip, sock->remote_ip,
+                            IPV4_DEFAULT_TTL, IPV4_PROTOCOL_TCP, tcp_raw, tcp_len)) {
+                size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
+                if (ip_len > 0) {
+                    host_send_l3_packet(host, &sock->remote_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
+                    sock->send_seq += data_len;
+                    printf("[%s] Sent %zu bytes via TCP\n", host->base.NAME, data_len);
+                }
+            }
+        }
+
+        return true;
+    } else if (count >= 2 && strcmp(tokens[1], "tcp_recv") == 0) {
+        // <host> tcp_recv
+        Host* host;
+
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+
+        // Find first ESTABLISHED socket on this host
+        TCPSocket* sock = NULL;
+        for (int i = 0; i < TCP_MAX_SOCKETS; i++) {
+            if (host->tcp_sockets[i].in_use &&
+                (host->tcp_sockets[i].state == TCP_ESTABLISHED ||
+                 host->tcp_sockets[i].has_data)) {
+                sock = &host->tcp_sockets[i];
+                break;
+            }
+        }
+
+        if (sock == NULL) {
+            printf("[%s] No TCP connection with data\n", host->base.NAME);
+            return true;
+        }
+
+        if (!sock->has_data) {
+            printf("[%s] No data available\n", host->base.NAME);
+            return true;
+        }
+
+        uint8_t buffer[TCP_MAX_PAYLOAD];
+        int received = tcp_socket_recv(sock, buffer, sizeof(buffer));
+        if (received > 0) {
+            buffer[received] = '\0';
+            printf("[%s] Received %d bytes: %s\n", host->base.NAME, received, (char*)buffer);
+        }
+
+        return true;
+    } else if (count >= 2 && strcmp(tokens[1], "tcp_close") == 0) {
+        // <host> tcp_close
+        Host* host;
+
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+
+        // Find first ESTABLISHED socket
+        TCPSocket* sock = NULL;
+        for (int i = 0; i < TCP_MAX_SOCKETS; i++) {
+            if (host->tcp_sockets[i].in_use &&
+                host->tcp_sockets[i].state == TCP_ESTABLISHED) {
+                sock = &host->tcp_sockets[i];
+                break;
+            }
+        }
+
+        if (sock == NULL) {
+            printf("[%s] No established TCP connection\n", host->base.NAME);
+            return true;
+        }
+
+        // Send FIN
+        uint8_t tcp_raw[TCP_HEADER_SIZE];
+        TCPSegment fin_seg;
+        tcp_init(&fin_seg);
+        fin_seg.src_port = sock->local_port;
+        fin_seg.dst_port = sock->remote_port;
+        fin_seg.seq_num = sock->send_seq;
+        fin_seg.ack_num = sock->recv_seq;
+        fin_seg.flags = TCP_FLAG_FIN | TCP_FLAG_ACK;
+        fin_seg.window = TCP_WINDOW_SIZE;
+
+        size_t tcp_len = packet_to_bytes((Packet*)&fin_seg, tcp_raw, sizeof(tcp_raw));
+        if (tcp_len > 0) {
+            fin_seg.checksum = tcp_compute_checksum(tcp_raw, tcp_len,
+                                                     &sock->local_ip, &sock->remote_ip);
+            tcp_len = packet_to_bytes((Packet*)&fin_seg, tcp_raw, sizeof(tcp_raw));
+
+            uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
+            IPv4Packet ip_pkt;
+            if (ipv4_create(&ip_pkt, sock->local_ip, sock->remote_ip,
+                            IPV4_DEFAULT_TTL, IPV4_PROTOCOL_TCP, tcp_raw, tcp_len)) {
+                size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
+                if (ip_len > 0) {
+                    host_send_l3_packet(host, &sock->remote_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
+                    tcp_socket_close(sock);
+                    printf("[%s] TCP connection closing (FIN sent)\n", host->base.NAME);
+                }
+            }
+        }
+
+        return true;
+    } else if (count >= 2 && strcmp(tokens[1], "tcp_status") == 0) {
+        // <host> tcp_status
+        Host* host;
+
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+
+        printf("[%s] TCP sockets:\n", host->base.NAME);
+        for (int i = 0; i < TCP_MAX_SOCKETS; i++) {
+            TCPSocket* s = &host->tcp_sockets[i];
+            if (!s->in_use) continue;
+
+            char local_ip[20], remote_ip[20];
+            ip_to_string(&s->local_ip, local_ip, sizeof(local_ip), false);
+            ip_to_string(&s->remote_ip, remote_ip, sizeof(remote_ip), false);
+
+            printf("  #%d: %s:%u <-> %s:%u [%s]%s%s\n",
+                   i, local_ip, s->local_port, remote_ip, s->remote_port,
+                   tcp_state_name(s->state),
+                   s->is_listening ? " LISTENING" : "",
+                   s->has_data ? " DATA" : "");
+        }
+
+        return true;
+    } else if (count >= 3 && strcmp(tokens[1], "udp_send") == 0) {
+        // <host> udp_send <ip> <dstport> <data>
+        Host* host;
+        IpAddress target_ip;
+
+        if (count < 5) {
+            printf("Usage: <host> udp_send <ip> <dstport> <data>\n");
+            return true;
+        }
+
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+
+        if (!ip_parse(tokens[2], &target_ip)) {
+            printf("Invalid IP: %s\n", tokens[2]);
+            return true;
+        }
+
+        int dst_port = atoi(tokens[3]);
+        if (dst_port <= 0 || dst_port > 65535) {
+            printf("Invalid port: %d\n", dst_port);
+            return true;
+        }
+
+        const char* data = tokens[4];
+        size_t data_len = strlen(data);
+        if (data_len > UDP_MAX_PAYLOAD) {
+            data_len = UDP_MAX_PAYLOAD;
+        }
+
+        UDPDatagram udp;
+        udp_init(&udp);
+        udp_create(&udp, (uint16_t)(dst_port + 2000), (uint16_t)dst_port,
+                   (const uint8_t*)data, data_len);
+
+        uint8_t udp_raw[UDP_HEADER_SIZE + UDP_MAX_PAYLOAD];
+        size_t udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
+        if (udp_len > 0) {
+            udp.checksum = udp_compute_checksum(udp_raw, udp_len,
+                                                 &host->ip_address, &target_ip);
+            udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
+
+            uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
+            IPv4Packet ip_pkt;
+            if (ipv4_create(&ip_pkt, host->ip_address, target_ip,
+                            IPV4_DEFAULT_TTL, IPV4_PROTOCOL_UDP, udp_raw, udp_len)) {
+                size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
+                if (ip_len > 0) {
+                    host_send_l3_packet(host, &target_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
+                    char udp_ip_buf[20];
+                    ip_to_string(&target_ip, udp_ip_buf, sizeof(udp_ip_buf), false);
+                    printf("[%s] Sent UDP datagram to %s:%d (%zu bytes)\n",
+                           host->base.NAME, udp_ip_buf, dst_port, data_len);
+                }
+            }
+        }
+
         return true;
     } else if (strcmp(tokens[0], "help") == 0){
         print_help();

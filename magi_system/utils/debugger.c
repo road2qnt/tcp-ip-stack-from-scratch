@@ -5,6 +5,10 @@
 #include "../layer2/host.h"
 #include "../layer2/switch.h"
 #include "../layer3/router.h"
+#include "../layer3/icmp.h"
+#include "../layer4/udp.h"
+#include "../layer4/tcp.h"
+#include "../layer4/tcp_socket.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -87,6 +91,60 @@ static void test_report_footer(void)
 static int node_exists(Simulator *sim, const char *name)
 {
     return simulator_find_node(sim, name) >= 0;
+}
+
+// Helper: Build an Ethernet frame containing an IPv4 packet as raw bytes
+static size_t build_ipv4_frame(uint8_t* out, size_t out_size,
+                               const MacAddress* dst_mac, const MacAddress* src_mac,
+                               const IpAddress* ip_src, const IpAddress* ip_dst,
+                               uint8_t ttl, uint8_t protocol,
+                               const uint8_t* payload, size_t payload_len)
+{
+    IPv4Packet ip_pkt;
+    EthernetFrame eth;
+    uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
+    size_t ip_len;
+
+    if (out == NULL || dst_mac == NULL || src_mac == NULL ||
+        ip_src == NULL || ip_dst == NULL) {
+        return 0;
+    }
+
+    if (!ipv4_create(&ip_pkt, *ip_src, *ip_dst, ttl, protocol, payload, payload_len)) {
+        return 0;
+    }
+
+    ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
+    if (ip_len == 0) return 0;
+
+    if (!ethernet_create(&eth, *dst_mac, *src_mac, ETHERNET_TYPE_IPV4, ip_raw, ip_len)) {
+        return 0;
+    }
+
+    return packet_to_bytes((Packet*)&eth, out, out_size);
+}
+
+// Helper: Build an Ethernet frame containing an ARP message as raw bytes
+static size_t build_arp_frame(uint8_t* out, size_t out_size,
+                              const MacAddress* dst_mac, const MacAddress* src_mac,
+                              const ARPMessage* arp)
+{
+    EthernetFrame eth;
+    uint8_t arp_raw[28];
+    size_t arp_len;
+
+    if (out == NULL || dst_mac == NULL || src_mac == NULL || arp == NULL) {
+        return 0;
+    }
+
+    arp_len = packet_to_bytes((Packet*)arp, arp_raw, sizeof(arp_raw));
+    if (arp_len == 0) return 0;
+
+    if (!ethernet_create(&eth, *dst_mac, *src_mac, ETHERNET_TYPE_ARP, arp_raw, arp_len)) {
+        return 0;
+    }
+
+    return packet_to_bytes((Packet*)&eth, out, out_size);
 }
 
 // Helper to check interface is linked
@@ -466,14 +524,873 @@ void debug_milestone_2(Simulator *sim)
     test_reset();
     test_report_header("Milestone 2: Network Layer (IPv4, ICMP, Routing)");
 
-    printf("\n" ANSI_YELLOW "  --- FEATURE NOT YET IMPLEMENTED ---\n" ANSI_RESET);
-    printf("  Planned tests for Milestone 2:\n");
-    printf("    - IPv4 packet serialization/checksum\n");
-    printf("    - Router routing table + longest prefix match\n");
-    printf("    - ICMP Echo Request/Reply (ping)\n");
-    printf("    - ICMP Time Exceeded (traceroute)\n");
-    printf("    - ICMP Destination Unreachable\n");
-    printf("    - TTL decrement and checksum recalculation\n\n");
+    uint8_t ip_a[] = {192, 168, 1, 10};
+    uint8_t ip_b[] = {10, 0, 0, 5};
+    uint8_t ip_c[] = {192, 168, 1, 1};    IpAddress src_ip = ip_init(ip_a, 24);
+    IpAddress dst_ip = ip_init(ip_b, 8);
+    IpAddress gw_ip = ip_init(ip_c, 24);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- IPv4 Address Utility Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T1: ip_init
+    TEST_MSG("ip_init creates correct IP",
+             src_ip.octet[0] == 192 && src_ip.octet[3] == 10 && src_ip.prefix == 24,
+             "got %d.%d.%d.%d/%d",
+             src_ip.octet[0], src_ip.octet[1], src_ip.octet[2], src_ip.octet[3], src_ip.prefix);
+
+    // T2: ip_equal with same IP/prefix
+    uint8_t same[] = {192, 168, 1, 10};
+    IpAddress same_ip = ip_init(same, 24);
+    TEST("ip_equal same IP and prefix", ip_equal(&src_ip, &same_ip));
+
+    // T3: ip_equal different prefix
+    IpAddress diff_prefix = ip_init(same, 16);
+    TEST("ip_equal different prefix fails", !ip_equal(&src_ip, &diff_prefix));
+
+    // T4: ip_equal different octet
+    uint8_t diff_octet[] = {192, 168, 1, 11};
+    IpAddress diff_ip = ip_init(diff_octet, 24);
+    TEST("ip_equal different IP fails", !ip_equal(&src_ip, &diff_ip));
+
+    // T5: ip_octets_equal_public (only compares octets, ignores prefix)
+    TEST("ip_octets_equal_public same IP", ip_octets_equal_public(&src_ip, &same_ip));
+    TEST("ip_octets_equal_public diff prefix ok", ip_octets_equal_public(&src_ip, &diff_prefix));
+    TEST("ip_octets_equal_public diff IP fails", !ip_octets_equal_public(&src_ip, &diff_ip));
+
+    // T6: ip_to_u32_public
+    uint32_t u32 = ip_to_u32_public(&src_ip);
+    TEST_MSG("ip_to_u32_public 192.168.1.10 = 0xC0A8010A",
+             u32 == 0xC0A8010A, "got 0x%08X", u32);
+
+    // T7: NULL safety
+    TEST("ip_to_u32_public NULL returns 0", ip_to_u32_public(NULL) == 0);
+    TEST("ip_octets_equal_public NULL returns false", !ip_octets_equal_public(NULL, &src_ip));
+
+    // T8: ip_prefix_to_mask
+    uint32_t m24 = ip_prefix_to_mask(24);
+    uint32_t m8 = ip_prefix_to_mask(8);
+    uint32_t m0 = ip_prefix_to_mask(0);
+    uint32_t m32 = ip_prefix_to_mask(32);
+    TEST_MSG("prefix /24 mask = 0xFFFFFF00", m24 == 0xFFFFFF00, "got 0x%08X", m24);
+    TEST_MSG("prefix /8 mask = 0xFF000000", m8 == 0xFF000000, "got 0x%08X", m8);
+    TEST_MSG("prefix /0 mask = 0", m0 == 0, "got 0x%08X", m0);
+    TEST_MSG("prefix /32 mask = 0xFFFFFFFF", m32 == 0xFFFFFFFF, "got 0x%08X", m32);
+
+    // T9: ip_network_address
+    IpAddress net = ip_network_address(src_ip);
+    TEST_MSG("ip_network_address 192.168.1.10/24 = 192.168.1.0",
+             net.octet[0] == 192 && net.octet[1] == 168 && net.octet[2] == 1 && net.octet[3] == 0,
+             "got %d.%d.%d.%d", net.octet[0], net.octet[1], net.octet[2], net.octet[3]);
+
+    net = ip_network_address(dst_ip);
+    TEST_MSG("ip_network_address 10.0.0.5/8 = 10.0.0.0",
+             net.octet[0] == 10 && net.octet[1] == 0 && net.octet[2] == 0 && net.octet[3] == 0,
+             "got %d.%d.%d.%d", net.octet[0], net.octet[1], net.octet[2], net.octet[3]);
+
+    // T10: ip_parse
+    IpAddress parsed;
+    int r = ip_parse("192.168.1.10/24", &parsed);
+    TEST("ip_parse succeeds", r == 1);
+    TEST("ip_parse correct octets",
+         parsed.octet[0] == 192 && parsed.octet[3] == 10);
+    TEST_MSG("ip_parse prefix = 24", parsed.prefix == 24, "got %u", parsed.prefix);
+
+    r = ip_parse("10.0.0.5", &parsed);
+    TEST("ip_parse without prefix succeeds", r == 1);
+    TEST_MSG("ip_parse no prefix defaults to 0", parsed.prefix == 0, "got %u", parsed.prefix);
+
+    r = ip_parse("invalid", &parsed);
+    TEST("ip_parse invalid string fails", r == 0);
+
+    r = ip_parse("999.999.999.999", &parsed);
+    TEST("ip_parse out-of-range octets fails", r == 0);
+
+    r = ip_parse("1.2.3.4/33", &parsed);
+    TEST("ip_parse prefix > 32 fails", r == 0);
+
+    // T11: ip_to_string
+    char ip_str[32];
+    ip_to_string(&src_ip, ip_str, sizeof(ip_str), true);
+    TEST_MSG("ip_to_string with prefix", strcmp(ip_str, "192.168.1.10/24") == 0,
+             "got '%s'", ip_str);
+    ip_to_string(&src_ip, ip_str, sizeof(ip_str), false);
+    TEST_MSG("ip_to_string without prefix", strcmp(ip_str, "192.168.1.10") == 0,
+             "got '%s'", ip_str);
+    ip_to_string(NULL, ip_str, sizeof(ip_str), false);
+    TEST_MSG("ip_to_string NULL", strcmp(ip_str, "?.?.?.?") == 0,
+             "got '%s'", ip_str);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- IPv4 Packet Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T12: ipv4_init
+    IPv4Packet ipv4;
+    ipv4_init(&ipv4);
+    TEST("ipv4_init type = IPV4", ipv4.base.type == IPV4);
+    TEST_MSG("ipv4_init version = 4", ipv4.version == 4, "got %u", ipv4.version);
+    TEST_MSG("ipv4_init ihl = 5", ipv4.ihl == 5, "got %u", ipv4.ihl);
+    TEST_MSG("ipv4_init ttl = %d", ipv4.ttl == IPV4_DEFAULT_TTL, "got %u", ipv4.ttl);
+    TEST_MSG("ipv4_init payload_len = 0", ipv4.payload_len == 0, "got %zu", ipv4.payload_len);
+
+    // T13: ipv4_create
+    const char* payload = "Hello Network!";
+    size_t payload_len = strlen(payload);
+    r = ipv4_create(&ipv4, src_ip, dst_ip, 64, IPV4_PROTOCOL_ICMP, (const uint8_t*)payload, payload_len);
+    TEST("ipv4_create succeeds", r == 1);
+    TEST_MSG("ipv4_create protocol = 1 (ICMP)", ipv4.protocol == IPV4_PROTOCOL_ICMP, "got %u", ipv4.protocol);
+    TEST_MSG("ipv4_create ttl = 64", ipv4.ttl == 64, "got %u", ipv4.ttl);
+    TEST_MSG("ipv4_create total_length = 20 + payload",
+             ipv4.total_length == IPV4_HEADER_SIZE + payload_len,
+             "got %u", ipv4.total_length);
+    TEST_MSG("ipv4_create payload_len matches", ipv4.payload_len == payload_len, "got %zu", ipv4.payload_len);
+    TEST("ipv4_create src_ip matches", ip_octets_equal_public(&ipv4.src_ip, &src_ip));
+    TEST("ipv4_create dst_ip matches", ip_octets_equal_public(&ipv4.dst_ip, &dst_ip));
+
+    // T14: ipv4_create with zero-length payload
+    IPv4Packet ipv4_empty;
+    r = ipv4_create(&ipv4_empty, src_ip, dst_ip, 64, IPV4_PROTOCOL_ICMP, NULL, 0);
+    TEST("ipv4_create with zero payload succeeds", r == 1);
+    TEST_MSG("ipv4_create zero payload total_length = 20",
+             ipv4_empty.total_length == IPV4_HEADER_SIZE, "got %u", ipv4_empty.total_length);
+
+    // T15: ipv4_create with oversized payload fails
+    uint8_t big_payload[IPV4_MAX_PAYLOAD + 1];
+    memset(big_payload, 0xAB, sizeof(big_payload));
+    r = ipv4_create(&ipv4_empty, src_ip, dst_ip, 64, IPV4_PROTOCOL_ICMP, big_payload, sizeof(big_payload));
+    TEST("ipv4_create with oversized payload fails", r == 0);
+
+    // T16: ipv4_create with NULL payload and non-zero len fails
+    r = ipv4_create(&ipv4_empty, src_ip, dst_ip, 64, IPV4_PROTOCOL_ICMP, NULL, 10);
+    TEST("ipv4_create with NULL payload and len>0 fails", r == 0);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- IPv4 Checksum Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T17: ipv4_compute_checksum on a known header
+    uint8_t sample_header[IPV4_HEADER_SIZE];
+    memset(sample_header, 0, sizeof(sample_header));
+    sample_header[0] = 0x45;
+    sample_header[2] = 0x00;
+    sample_header[3] = 0x1C;
+    sample_header[8] = 64;
+    sample_header[9] = IPV4_PROTOCOL_ICMP;
+    sample_header[12] = 192; sample_header[13] = 168; sample_header[14] = 1; sample_header[15] = 10;
+    sample_header[16] = 10; sample_header[17] = 0; sample_header[18] = 0; sample_header[19] = 5;
+
+    // Temporarily set checksum field to 0 for computation
+    uint16_t cksum = ipv4_compute_checksum(sample_header, IPV4_HEADER_SIZE);
+    TEST("ipv4_compute_checksum returns non-zero", cksum != 0);
+
+    // Store checksum and verify
+    sample_header[10] = (uint8_t)(cksum >> 8);
+    sample_header[11] = (uint8_t)(cksum & 0xFF);
+    uint16_t verify = ipv4_compute_checksum(sample_header, IPV4_HEADER_SIZE);
+    TEST_MSG("ipv4 checksum stored correctly verifies to 0", verify == 0, "got 0x%04X", verify);
+
+    // T18: ipv4_validate_checksum
+    // Create a proper packet and validate
+    IPv4Packet ipv4_cksum;
+    ipv4_create(&ipv4_cksum, src_ip, dst_ip, 64, IPV4_PROTOCOL_ICMP, (const uint8_t*)payload, payload_len);
+    // Serialize (this computes and inserts checksum)
+    uint8_t raw_ip[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
+    size_t raw_ip_len = packet_to_bytes((Packet*)&ipv4_cksum, raw_ip, sizeof(raw_ip));
+    TEST("IPv4 to_bytes succeeds", raw_ip_len > 0);
+
+    IPv4Packet ipv4_parsed;
+    ipv4_init(&ipv4_parsed);
+    r = packet_from_bytes((Packet*)&ipv4_parsed, raw_ip, raw_ip_len);
+    TEST("IPv4 from_bytes succeeds", r == 1);
+    TEST("IPv4 roundtrip src_ip", ip_octets_equal_public(&ipv4_parsed.src_ip, &src_ip));
+    TEST("IPv4 roundtrip dst_ip", ip_octets_equal_public(&ipv4_parsed.dst_ip, &dst_ip));
+    TEST_MSG("IPv4 roundtrip ttl", ipv4_parsed.ttl == 64, "got %u", ipv4_parsed.ttl);
+    TEST("IPv4 roundtrip protocol = ICMP", ipv4_parsed.protocol == IPV4_PROTOCOL_ICMP);
+    TEST_MSG("IPv4 roundtrip payload_len", ipv4_parsed.payload_len == payload_len, "got %zu", ipv4_parsed.payload_len);
+    TEST("IPv4 roundtrip payload matches", memcmp(ipv4_parsed.payload, payload, payload_len) == 0);
+    TEST("IPv4 validate checksum after roundtrip", ipv4_validate_checksum(&ipv4_parsed));
+
+    // T19: Modify payload and verify checksum still valid (IPv4 checksum is header-only)
+    // Actually, changing payload doesn't affect IPv4 checksum since it's only over header
+    IPv4Packet ipv4_corrupt = ipv4_parsed;
+    ipv4_corrupt.ttl = 63;  // TTL is in header - changing it breaks checksum
+    TEST("IPv4 checksum fails after TTL modified", !ipv4_validate_checksum(&ipv4_corrupt));
+
+    // T20: NULL safety
+    TEST("ipv4_compute_checksum NULL returns 0", ipv4_compute_checksum(NULL, 10) == 0);
+    TEST("ipv4_validate_checksum NULL returns false", !ipv4_validate_checksum(NULL));
+
+    // T21: ipv4_from_bytes with too-short buffer
+    uint8_t tiny[10];
+    memcpy(tiny, raw_ip, 10);
+    IPv4Packet ipv4_bad;
+    r = ipv4_from_bytes(&ipv4_bad, tiny, 10);
+    TEST("ipv4_from_bytes with <20 bytes fails", r == 0);
+
+    // T22: ipv4_to_bytes with insufficient buffer
+    uint8_t small_buf[5];
+    size_t len = ipv4_to_bytes(&ipv4_cksum, small_buf, 5);
+    TEST("ipv4_to_bytes with small buffer returns 0", len == 0);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- ICMP Message Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T23: icmp_init
+    ICMPMessage icmp;
+    icmp_init(&icmp);
+    TEST("icmp_init type = ICMP", icmp.base.type == ICMP);
+    TEST("icmp_init type = 0", icmp.type == 0);
+    TEST("icmp_init payload_len = 0", icmp.payload_len == 0);
+
+    // T24: icmp_create Echo Request
+    const char* icmp_data = "Ping data payload";
+    size_t icmp_data_len = strlen(icmp_data);
+    r = icmp_create(&icmp, ICMP_ECHO_REQUEST, 0, 0xBEEF, 1, (const uint8_t*)icmp_data, icmp_data_len);
+    TEST("icmp_create Echo Request succeeds", r == 1);
+    TEST_MSG("icmp type = %d (Echo Request)", icmp.type == ICMP_ECHO_REQUEST, "got %u", icmp.type);
+    TEST_MSG("icmp code = 0", icmp.code == 0, "got %u", icmp.code);
+    TEST_MSG("icmp identifier = 0xBEEF", icmp.identifier == 0xBEEF, "got 0x%04X", icmp.identifier);
+    TEST_MSG("icmp sequence = 1", icmp.sequence == 1, "got %u", icmp.sequence);
+
+    // T25: icmp Echo Request serialization roundtrip
+    uint8_t icmp_raw_echo[ICMP_HEADER_SIZE + ICMP_MAX_PAYLOAD];
+    size_t icmp_len = packet_to_bytes((Packet*)&icmp, icmp_raw_echo, sizeof(icmp_raw_echo));
+    TEST_MSG("ICMP to_bytes length = header + payload",
+             icmp_len == ICMP_HEADER_SIZE + icmp_data_len,
+             "got %zu", icmp_len);
+
+    ICMPMessage icmp2;
+    icmp_init(&icmp2);
+    r = packet_from_bytes((Packet*)&icmp2, icmp_raw_echo, icmp_len);
+    TEST("ICMP from_bytes succeeds", r == 1);
+    TEST_MSG("ICMP roundtrip type", icmp2.type == ICMP_ECHO_REQUEST, "got %u", icmp2.type);
+    TEST_MSG("ICMP roundtrip identifier", icmp2.identifier == 0xBEEF, "got 0x%04X", icmp2.identifier);
+    TEST_MSG("ICMP roundtrip sequence", icmp2.sequence == 1, "got %u", icmp2.sequence);
+    TEST_MSG("ICMP roundtrip payload_len", icmp2.payload_len == icmp_data_len, "got %zu", icmp2.payload_len);
+    TEST("ICMP roundtrip payload matches", memcmp(icmp2.payload, icmp_data, icmp_data_len) == 0);
+
+    // T26: icmp_validate_checksum
+    // Checksum is computed during serialization (to_bytes), so validate on parsed copy
+    TEST("ICMP checksum valid on parsed packet", icmp_validate_checksum(&icmp2));
+
+    // Corrupt the checksum
+    ICMPMessage icmp_corrupt = icmp2;
+    icmp_corrupt.checksum = 0xFFFF;
+    TEST("ICMP checksum fails after corruption", !icmp_validate_checksum(&icmp_corrupt));
+
+    // T27: icmp_create Echo Reply
+    ICMPMessage icmp_reply;
+    icmp_create(&icmp_reply, ICMP_ECHO_REPLY, 0, 0xBEEF, 1, (const uint8_t*)icmp_data, icmp_data_len);
+    TEST_MSG("ICMP Echo Reply type = %d", icmp_reply.type == ICMP_ECHO_REPLY, "got %u", icmp_reply.type);
+
+    icmp_len = packet_to_bytes((Packet*)&icmp_reply, icmp_raw_echo, sizeof(icmp_raw_echo));
+    ICMPMessage icmp_reply2;
+    icmp_init(&icmp_reply2);
+    packet_from_bytes((Packet*)&icmp_reply2, icmp_raw_echo, icmp_len);
+    TEST("ICMP Echo Reply roundtrip", icmp_reply2.type == ICMP_ECHO_REPLY);
+    TEST("ICMP Echo Reply checksum valid", icmp_validate_checksum(&icmp_reply2));
+
+    // T28: icmp_create Time Exceeded
+    uint8_t orig_packet[28];
+    memset(orig_packet, 0xAA, sizeof(orig_packet));
+    ICMPMessage icmp_ttl;
+    icmp_create(&icmp_ttl, ICMP_TIME_EXCEEDED, 0, 0, 0, orig_packet, sizeof(orig_packet));
+    TEST_MSG("ICMP Time Exceeded type = %d", icmp_ttl.type == ICMP_TIME_EXCEEDED, "got %u", icmp_ttl.type);
+    TEST_MSG("ICMP Time Exceeded payload len = 28", icmp_ttl.payload_len == 28, "got %zu", icmp_ttl.payload_len);
+
+    icmp_len = packet_to_bytes((Packet*)&icmp_ttl, icmp_raw_echo, sizeof(icmp_raw_echo));
+    ICMPMessage icmp_ttl2;
+    icmp_init(&icmp_ttl2);
+    packet_from_bytes((Packet*)&icmp_ttl2, icmp_raw_echo, icmp_len);
+    TEST("ICMP Time Exceeded roundtrip", icmp_ttl2.type == ICMP_TIME_EXCEEDED);
+    TEST("ICMP Time Exceeded checksum valid", icmp_validate_checksum(&icmp_ttl2));
+
+    // T29: icmp_create Destination Unreachable
+    ICMPMessage icmp_unreach;
+    icmp_create(&icmp_unreach, ICMP_DEST_UNREACHABLE, 0, 0, 0, orig_packet, sizeof(orig_packet));
+    TEST_MSG("ICMP Dest Unreachable type = %d", icmp_unreach.type == ICMP_DEST_UNREACHABLE, "got %u", icmp_unreach.type);
+    // Serialize, parse, then validate checksum on parsed copy
+    icmp_len = packet_to_bytes((Packet*)&icmp_unreach, icmp_raw_echo, sizeof(icmp_raw_echo));
+    ICMPMessage icmp_unreach2;
+    icmp_init(&icmp_unreach2);
+    packet_from_bytes((Packet*)&icmp_unreach2, icmp_raw_echo, icmp_len);
+    TEST("ICMP Dest Unreachable checksum valid", icmp_validate_checksum(&icmp_unreach2));
+
+    // T30: ICMP create with oversized payload fails
+    {
+        uint8_t big_icmp_payload[ICMP_MAX_PAYLOAD + 1];
+        r = icmp_create(&icmp, ICMP_ECHO_REQUEST, 0, 0, 0, big_icmp_payload, ICMP_MAX_PAYLOAD + 1);
+        TEST("icmp_create oversized payload fails", r == 0);
+    }
+
+    // T31: ICMP create with NULL payload and len > 0 fails
+    r = icmp_create(&icmp, ICMP_ECHO_REQUEST, 0, 0, 0, NULL, 5);
+    TEST("icmp_create NULL payload fails", r == 0);
+
+    // T32: ICMP from_bytes with too-short buffer
+    uint8_t short_raw[4];
+    ICMPMessage icmp_short;
+    r = icmp_from_bytes(&icmp_short, short_raw, 4);
+    TEST("icmp_from_bytes < 8 bytes fails", r == 0);
+
+    // T33: NULL safety
+    TEST("icmp_validate_checksum NULL returns false", !icmp_validate_checksum(NULL));
+    TEST("icmp_compute_checksum NULL returns 0", icmp_compute_checksum(NULL, 10) == 0);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- Routing Table Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T34: router_init
+    Router router;
+    router_init(&router, 4);
+    TEST("router_init NUM_INTERFACES = 4", router.base.NUM_INTERFACES == 4);
+    TEST("router_init route_count = 0", router.route_count == 0);
+    TEST("router_init ARP table empty", router.arp_table.size == 0);
+    TEST("router_init pending queue empty", router.pending_queue.size == 0);
+
+    // T35: router_add_route - broad /16 route for LPM testing
+    uint8_t zero_octets[] = {0, 0, 0, 0};
+    IpAddress zero_hop = ip_init(zero_octets, 0);
+    uint8_t broad_octets[] = {192, 168, 0, 0};
+    IpAddress broad_net = ip_init(broad_octets, 16);
+    r = router_add_route(&router, broad_net, zero_hop, 1);
+    TEST("router_add_route /16 direct route succeeds", r == 1);
+    TEST_MSG("route_count = 1", router.route_count == 1, "got %zu", router.route_count);
+
+    // T36: router_add_route with next_hop
+    r = router_add_route(&router, dst_ip, src_ip, 2);
+    TEST("router_add_route with next_hop succeeds", r == 1);
+    TEST_MSG("route_count = 2", router.route_count == 2, "got %zu", router.route_count);
+
+    // T37: Duplicate route (should be idempotent, return 1)
+    r = router_add_route(&router, broad_net, zero_hop, 1);
+    TEST("router_add_route duplicate returns 1", r == 1);
+    TEST_MSG("route_count still 2", router.route_count == 2, "got %zu", router.route_count);
+
+    // T38: router_lookup_route - longest prefix match
+    // Add a more specific /24 route for 192.168.1.0/24 via interface 3
+    uint8_t specific_octets[] = {192, 168, 1, 0};
+    IpAddress specific_net = ip_init(specific_octets, 24);
+    router_add_route(&router, specific_net, zero_hop, 3);
+    TEST_MSG("route_count = 3 after adding /24", router.route_count == 3, "got %zu", router.route_count);
+
+    // Now lookup 192.168.1.10 - should match /24 (more specific than /16)
+    const RoutingTableEntry* route = router_lookup_route(&router, &src_ip);
+    TEST("router_lookup_route finds a route", route != NULL);
+    TEST_MSG("Longest prefix match: /24 (iface 3) wins over /16 (iface 1)",
+             route != NULL && route->out_interface == 3,
+             "got interface %d", route ? route->out_interface : -1);
+
+    // T39: router_lookup_route - default route (0.0.0.0/0)
+    IpAddress unknown_ip = ip_init(ip_a, 24);
+    unknown_ip.octet[0] = 8;  // 8.8.8.8 - no specific route
+    unknown_ip.octet[1] = 8;
+    unknown_ip.octet[2] = 8;
+    unknown_ip.octet[3] = 8;
+    route = router_lookup_route(&router, &unknown_ip);
+    TEST("No route for unknown IP before default", route == NULL);
+
+    // Add default route
+    uint8_t default_octets[] = {0, 0, 0, 0};
+    IpAddress default_net = ip_init(default_octets, 0);
+    router_add_route(&router, default_net, zero_hop, 4);
+
+    route = router_lookup_route(&router, &unknown_ip);
+    TEST("Default route matches unknown IP", route != NULL);
+    TEST_MSG("Default route interface = 4",
+             route != NULL && route->out_interface == 4,
+             "got interface %d", route ? route->out_interface : -1);
+
+    // T40: router_lookup_route with more specific still wins over default
+    route = router_lookup_route(&router, &src_ip);
+    TEST("Specific /24 still wins over default", route != NULL);
+    TEST_MSG("Still interface 3 (not default)", route != NULL && route->out_interface == 3,
+             "got interface %d", route ? route->out_interface : -1);
+
+    // T41: router_lookup_route with NULL returns NULL
+    route = router_lookup_route(&router, NULL);
+    TEST("router_lookup_route NULL returns NULL", route == NULL);
+
+    // T42: router_add_direct_routes
+    Router router2;
+    router_init(&router2, 3);
+    // Set interface IPs first
+    uint8_t ip_port1[] = {10, 0, 0, 1};
+    uint8_t ip_port2[] = {172, 16, 0, 1};
+    uint8_t ip_port3[] = {192, 168, 1, 1};
+    router2.interface_ips[0].ip_address = ip_init(ip_port1, 8);
+    router2.interface_ips[0].has_ip = true;
+    router2.interface_ips[1].ip_address = ip_init(ip_port2, 16);
+    router2.interface_ips[1].has_ip = true;
+    router2.interface_ips[2].ip_address = ip_init(ip_port3, 24);
+    router2.interface_ips[2].has_ip = true;
+
+    int added = router_add_direct_routes(&router2);
+    TEST_MSG("router_add_direct_routes adds 3 routes", added == 3, "got %d", added);
+    TEST_MSG("route_count = 3", router2.route_count == 3, "got %zu", router2.route_count);
+
+    // Verify lookup
+    uint8_t test_ip[] = {10, 0, 0, 5};
+    IpAddress test = ip_init(test_ip, 24);
+    route = router_lookup_route(&router2, &test);
+    TEST("Direct route matches 10.0.0.5 via interface 1",
+         route != NULL && route->out_interface == 1);
+
+    test_ip[0] = 172; test_ip[1] = 16; test_ip[2] = 0; test_ip[3] = 5;
+    test = ip_init(test_ip, 24);
+    route = router_lookup_route(&router2, &test);
+    TEST("Direct route matches 172.16.0.5 via interface 2",
+         route != NULL && route->out_interface == 2);
+
+    test_ip[0] = 192; test_ip[1] = 168; test_ip[2] = 1; test_ip[3] = 10;
+    test = ip_init(test_ip, 24);
+    route = router_lookup_route(&router2, &test);
+    TEST("Direct route matches 192.168.1.10 via interface 3",
+         route != NULL && route->out_interface == 3);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- Router ARP & Pending Queue Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T43: router ARP learning
+    ARPMessage arp_reply;
+    uint8_t mac_bytes[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+    MacAddress test_mac;
+    memcpy(test_mac.bytes, mac_bytes, 6);
+    uint8_t sender_mac_bytes[] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+    MacAddress sender_mac;
+    memcpy(sender_mac.bytes, sender_mac_bytes, 6);
+
+    arp_message_init_reply(&arp_reply, test_mac, src_ip, sender_mac, src_ip);
+    r = router_learn_arp(&router, &arp_reply, 10);
+    TEST("router_learn_arp succeeds", r == 1);
+    TEST_MSG("router ARP table size = 1", router.arp_table.size == 1, "got %zu", router.arp_table.size);
+
+    // T44: Router ARP lookup
+    const MacAddress* found_mac = arp_table_get_const(&router.arp_table, &src_ip);
+    TEST("Router ARP lookup finds MAC", found_mac != NULL);
+    int mac_match = found_mac && memcmp(found_mac->bytes, mac_bytes, 6) == 0;
+    TEST("Router ARP MAC matches", mac_match);
+
+    // T45: Router pending queue
+    TEST("Router pending queue initially empty", router.pending_queue.size == 0);
+
+    // T46: Router pending queue enqueue/dequeue
+    RouterPendingQueue* queue = &router.pending_queue;
+    router_pending_queue_init(queue);
+    TEST("Pending queue init resets", queue->size == 0 && queue->head == 0 && queue->tail == 0);
+
+    IPv4Packet test_pkt;
+    ipv4_create(&test_pkt, src_ip, dst_ip, 64, IPV4_PROTOCOL_ICMP, (const uint8_t*)"test", 4);
+
+    // Enqueue via internal helpers actually... the pending queue functions are static in router.c
+    // We'll verify via the existing abstracted test indirectly
+    // For now, verify queue init works
+    TEST("Queue init valid", queue->head == 0 && queue->tail == 0);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- Router Interface & VLAN Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T47: Router interface IP configuration
+    Router router3;
+    router_init(&router3, 2);
+    router3.interface_ips[0].ip_address = gw_ip;
+    router3.interface_ips[0].has_ip = true;
+    router3.interface_ips[1].ip_address = dst_ip;
+    router3.interface_ips[1].has_ip = true;
+
+    TEST("Router3 port1 IP configured", router3.interface_ips[0].has_ip);
+    TEST_MSG("Router3 port1 IP = 192.168.1.1/24",
+             router3.interface_ips[0].ip_address.octet[0] == 192 &&
+             router3.interface_ips[0].ip_address.octet[3] == 1 &&
+             router3.interface_ips[0].ip_address.prefix == 24,
+             "got %d.%d.%d.%d/%d",
+             router3.interface_ips[0].ip_address.octet[0],
+             router3.interface_ips[0].ip_address.octet[1],
+             router3.interface_ips[0].ip_address.octet[2],
+             router3.interface_ips[0].ip_address.octet[3],
+             router3.interface_ips[0].ip_address.prefix);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- End-to-End Topology Routing Test ---\n" ANSI_RESET);
+    // ========================================
+
+    // T48: Load the spec topology and verify router config
+    Simulator e2e_sim;
+    simulator_init(&e2e_sim);
+    r = simulator_load(&e2e_sim, "magi_system/topology.json");
+    TEST("Load topology.json successfully", r == 1);
+
+    int ridx = simulator_find_node(&e2e_sim, "R1");
+    TEST("R1 exists in topology", ridx >= 0);
+
+    if (ridx >= 0) {
+        Router* r1 = (Router*)e2e_sim.nodes[ridx].node;
+
+        // T49: R1 interface IPs
+        TEST("R1 port1 has IP", r1->interface_ips[0].has_ip);
+        TEST("R1 port2 has IP", r1->interface_ips[1].has_ip);
+        TEST_MSG("R1 port1 IP = 192.168.1.1/24",
+                 r1->interface_ips[0].ip_address.octet[0] == 192 &&
+                 r1->interface_ips[0].ip_address.octet[3] == 1 &&
+                 r1->interface_ips[0].ip_address.prefix == 24,
+                 "got %d.%d.%d.%d/%d",
+                 r1->interface_ips[0].ip_address.octet[0],
+                 r1->interface_ips[0].ip_address.octet[1],
+                 r1->interface_ips[0].ip_address.octet[2],
+                 r1->interface_ips[0].ip_address.octet[3],
+                 r1->interface_ips[0].ip_address.prefix);
+        TEST_MSG("R1 port2 IP = 10.0.0.1/8",
+                 r1->interface_ips[1].ip_address.octet[0] == 10 &&
+                 r1->interface_ips[1].ip_address.octet[3] == 1 &&
+                 r1->interface_ips[1].ip_address.prefix == 8,
+                 "got %d.%d.%d.%d/%d",
+                 r1->interface_ips[1].ip_address.octet[0],
+                 r1->interface_ips[1].ip_address.octet[1],
+                 r1->interface_ips[1].ip_address.octet[2],
+                 r1->interface_ips[1].ip_address.octet[3],
+                 r1->interface_ips[1].ip_address.prefix);
+
+        // T50: R1 routes from spec
+        TEST_MSG("R1 has %zu routes (direct + default)", r1->route_count >= 2, "got %zu", r1->route_count);
+
+        // T51: Verify routing works - lookup H2 (10.0.0.5) should hit via direct route
+        route = router_lookup_route(r1, &dst_ip);
+        TEST("R1 can route to 10.0.0.5", route != NULL);
+        TEST_MSG("R1 routes 10.0.0.5 via interface 2",
+                 route != NULL && route->out_interface == 2,
+                 "got interface %d", route ? route->out_interface : -1);
+
+        // T52: Verify routing to H1 (192.168.1.10) via interface 1
+        route = router_lookup_route(r1, &src_ip);
+        TEST("R1 can route to 192.168.1.10", route != NULL);
+        TEST_MSG("R1 routes 192.168.1.10 via interface 1",
+                 route != NULL && route->out_interface == 1,
+                 "got interface %d", route ? route->out_interface : -1);
+
+        // T53: Unknown IP hits default route
+        uint8_t unknown_octets[] = {8, 8, 8, 8};
+        IpAddress unknown = ip_init(unknown_octets, 0);
+        route = router_lookup_route(r1, &unknown);
+        TEST("R1 default route matches 8.8.8.8", route != NULL);
+        TEST_MSG("Default route via interface 2",
+                 route != NULL && route->out_interface == 2,
+                 "got interface %d", route ? route->out_interface : -1);
+    }
+
+    // T54: H1 has correct IP from topology
+    int hidx = simulator_find_node(&e2e_sim, "H1");
+    TEST("H1 exists", hidx >= 0);
+    if (hidx >= 0) {
+        Host* h1 = (Host*)e2e_sim.nodes[hidx].node;
+        TEST("H1 has IP", h1->has_ip);
+        TEST_MSG("H1 IP = 192.168.1.10/24",
+                 h1->has_ip &&
+                 h1->ip_address.octet[0] == 192 &&
+                 h1->ip_address.octet[3] == 10 &&
+                 h1->ip_address.prefix == 24,
+                 "got %d.%d.%d.%d/%d",
+                 h1->ip_address.octet[0],
+                 h1->ip_address.octet[1],
+                 h1->ip_address.octet[2],
+                 h1->ip_address.octet[3],
+                 h1->ip_address.prefix);
+    }
+
+    // T55: H2 has correct IP from topology
+    int h2idx = simulator_find_node(&e2e_sim, "H2");
+    TEST("H2 exists", h2idx >= 0);
+    if (h2idx >= 0) {
+        Host* h2 = (Host*)e2e_sim.nodes[h2idx].node;
+        TEST("H2 has IP", h2->has_ip);
+        TEST_MSG("H2 IP = 10.0.0.5/8",
+                 h2->has_ip &&
+                 h2->ip_address.octet[0] == 10 &&
+                 h2->ip_address.octet[3] == 5 &&
+                 h2->ip_address.prefix == 8,
+                 "got %d.%d.%d.%d/%d",
+                 h2->ip_address.octet[0],
+                 h2->ip_address.octet[1],
+                 h2->ip_address.octet[2],
+                 h2->ip_address.octet[3],
+                 h2->ip_address.prefix);
+    }
+
+    // T56: Verify H2's default gateway = 10.0.0.1
+    if (h2idx >= 0) {
+        Host* h2 = (Host*)e2e_sim.nodes[h2idx].node;
+        TEST_MSG("H2 gateway = 10.0.0.1",
+                 h2->default_gateway.octet[0] == 10 &&
+                 h2->default_gateway.octet[3] == 1,
+                 "got %d.%d.%d.%d",
+                 h2->default_gateway.octet[0],
+                 h2->default_gateway.octet[1],
+                 h2->default_gateway.octet[2],
+                 h2->default_gateway.octet[3]);
+    }
+
+    // T57: Verify links exist between proper interfaces
+    TEST("H1 linked", is_linked(&e2e_sim, "H1:1"));
+    TEST("H2 linked", is_linked(&e2e_sim, "H2:1"));
+    TEST("R1 port1 linked", is_linked(&e2e_sim, "R1:1"));
+    TEST("R1 port2 linked", is_linked(&e2e_sim, "R1:2"));
+    TEST("SW1 port1 linked", is_linked(&e2e_sim, "SW1:1"));
+    TEST("SW1 port24 linked", is_linked(&e2e_sim, "SW1:24"));
+    TEST_MSG("Link count = 3", e2e_sim.link_count == 3, "got %zu", e2e_sim.link_count);
+
+    simulator_clear(&e2e_sim);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- Router Forwarding Integration Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // Create a dedicated router for forwarding tests
+    Router fwd_router;
+    router_init(&fwd_router, 2);
+    strncpy(fwd_router.base.NAME, "R1", MAX_NAME - 1);
+
+    // Configure interface IPs
+    {
+        uint8_t ip1[] = {192, 168, 1, 1};
+        fwd_router.interface_ips[0].ip_address = ip_init(ip1, 24);
+        fwd_router.interface_ips[0].has_ip = true;
+        uint8_t ip2[] = {10, 0, 0, 1};
+        fwd_router.interface_ips[1].ip_address = ip_init(ip2, 8);
+        fwd_router.interface_ips[1].has_ip = true;
+    }
+
+    // Add direct routes
+    {
+        uint8_t zero[] = {0, 0, 0, 0};
+        IpAddress zero_hop = ip_init(zero, 0);
+        uint8_t n1[] = {192, 168, 1, 0};
+        router_add_route(&fwd_router, ip_init(n1, 24), zero_hop, 1);
+        uint8_t n2[] = {10, 0, 0, 0};
+        router_add_route(&fwd_router, ip_init(n2, 8), zero_hop, 2);
+    }
+
+    // IPs for test packets
+    uint8_t src_arr[] = {192, 168, 1, 10};
+    IpAddress src_ip_fwd = ip_init(src_arr, 24);
+    uint8_t dst_arr[] = {10, 0, 0, 5};
+    IpAddress dst_ip_fwd = ip_init(dst_arr, 8);
+
+    Interface* iface1 = node_get_interface(&fwd_router.base, 1);
+    Interface* iface2 = node_get_interface(&fwd_router.base, 2);
+    MacAddress broadcast = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+
+    // Create a small ICMP Echo payload to use as IPv4 payload
+    uint8_t icmp_payload_raw[ICMP_HEADER_SIZE + ICMP_MAX_PAYLOAD];
+    size_t icmp_payload_len;
+    {
+        ICMPMessage ping;
+        icmp_create(&ping, ICMP_ECHO_REQUEST, 0, 0xBEEF, 1, (const uint8_t*)"Ping", 4);
+        icmp_payload_len = packet_to_bytes((Packet*)&ping, icmp_payload_raw, sizeof(icmp_payload_raw));
+    }
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- TTL Time Exceeded Test ---\n" ANSI_RESET);
+    // ========================================
+
+    // Test TTL=1 causes ICMP Time Exceeded
+    // The ICMP error goes back to src, needs ARP → gets queued
+    // We verify by checking the queued packet's dst_ip (should be src_ip, not dst_ip)
+    {
+        // Reset state
+        router_pending_queue_init(&fwd_router.pending_queue);
+        arp_table_init(&fwd_router.arp_table);
+
+        uint8_t raw[ETHERNET_VLAN_HEADER_SIZE + ETHERNET_MAX_PAYLOAD];
+        MacAddress src_mac = {{0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA}};
+
+        // Build IPv4 with TTL=1, wrapped in Ethernet → router interface 1
+        size_t raw_len = build_ipv4_frame(raw, sizeof(raw), &broadcast, &src_mac,
+                                          &src_ip_fwd, &dst_ip_fwd, 1, IPV4_PROTOCOL_ICMP,
+                                          icmp_payload_raw, icmp_payload_len);
+
+        TEST("TTL: Build frame succeeds", raw_len > 0);
+        node_receive(&fwd_router.base, iface1, raw, raw_len);
+
+        // Router does NOT learn ARP from IPv4 packets (only from ARP messages)
+        TEST_MSG("TTL: ARP table empty after IPv4 receive", fwd_router.arp_table.size == 0,
+                 "got %zu", fwd_router.arp_table.size);
+
+        // The ICMP error should be queued waiting for ARP resolution of source
+        TEST_MSG("TTL: ICMP error queued (pending=%zu)", fwd_router.pending_queue.size == 1,
+                 "got %zu", fwd_router.pending_queue.size);
+
+        // Verify the queued packet is the ICMP error going BACK to src, not the original
+        if (fwd_router.pending_queue.size > 0) {
+            RouterPendingPacket* q = &fwd_router.pending_queue.items[fwd_router.pending_queue.head];
+            TEST("TTL: Queued dst = source IP (ICMP error going back)",
+                 ip_octets_equal_public(&q->packet.dst_ip, &src_ip_fwd));
+        }
+    }
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- Dest Unreachable (No Route) Test ---\n" ANSI_RESET);
+    // ========================================
+
+    // Test packet to unreachable destination → ICMP Dest Unreachable
+    {
+        router_pending_queue_init(&fwd_router.pending_queue);
+        arp_table_init(&fwd_router.arp_table);
+
+        uint8_t raw[ETHERNET_VLAN_HEADER_SIZE + ETHERNET_MAX_PAYLOAD];
+        MacAddress src_mac = {{0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB}};
+
+        // 8.8.8.8 has no route in our routing table
+        uint8_t unknown_arr[] = {8, 8, 8, 8};
+        IpAddress unknown_dst = ip_init(unknown_arr, 0);
+
+        size_t raw_len = build_ipv4_frame(raw, sizeof(raw), &broadcast, &src_mac,
+                                          &src_ip_fwd, &unknown_dst, 64, IPV4_PROTOCOL_ICMP,
+                                          icmp_payload_raw, icmp_payload_len);
+
+        TEST("NoRoute: Build frame succeeds", raw_len > 0);
+        node_receive(&fwd_router.base, iface1, raw, raw_len);
+
+        // ARP not learned from IPv4 packets (only from ARP messages)
+        TEST_MSG("NoRoute: ARP table empty after IPv4 receive", fwd_router.arp_table.size == 0,
+                 "got %zu", fwd_router.arp_table.size);
+
+        // ICMP Dest Unreachable should be queued (waiting for ARP to source)
+        TEST_MSG("NoRoute: ICMP error queued (pending=%zu)", fwd_router.pending_queue.size == 1,
+                 "got %zu", fwd_router.pending_queue.size);
+
+        // The queued packet should be the ICMP error going back to src
+        if (fwd_router.pending_queue.size > 0) {
+            RouterPendingPacket* q = &fwd_router.pending_queue.items[fwd_router.pending_queue.head];
+            TEST("NoRoute: Queued dst = source IP (ICMP error going back)",
+                 ip_octets_equal_public(&q->packet.dst_ip, &src_ip_fwd));
+            TEST("NoRoute: Queued next_hop = source IP",
+                 ip_octets_equal_public(&q->next_hop_ip, &src_ip_fwd));
+        }
+    }
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- ARP Miss -> Queue + ARP Request Test ---\n" ANSI_RESET);
+    // ========================================
+
+    // Test packet forwarding when ARP cache is cold → queue + ARP request
+    {
+        router_pending_queue_init(&fwd_router.pending_queue);
+        arp_table_init(&fwd_router.arp_table);
+
+        uint8_t raw[ETHERNET_VLAN_HEADER_SIZE + ETHERNET_MAX_PAYLOAD];
+        MacAddress src_mac = {{0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC}};
+
+        size_t raw_len = build_ipv4_frame(raw, sizeof(raw), &broadcast, &src_mac,
+                                          &src_ip_fwd, &dst_ip_fwd, 64, IPV4_PROTOCOL_ICMP,
+                                          icmp_payload_raw, icmp_payload_len);
+
+        TEST("ARP: Build frame succeeds", raw_len > 0);
+        node_receive(&fwd_router.base, iface1, raw, raw_len);
+
+        // Original packet should be queued (waiting for ARP resolution of dst)
+        TEST_MSG("ARP: Original packet queued (pending=%zu)", fwd_router.pending_queue.size == 1,
+                 "got %zu", fwd_router.pending_queue.size);
+
+        // Verify the queued packet is the ORIGINAL (dst=dst_ip), NOT an ICMP error
+        if (fwd_router.pending_queue.size > 0) {
+            RouterPendingPacket* q = &fwd_router.pending_queue.items[fwd_router.pending_queue.head];
+            TEST("ARP: Queued dst = original destination IP (forwarding, not error)",
+                 ip_octets_equal_public(&q->packet.dst_ip, &dst_ip_fwd));
+            TEST("ARP: Queued next_hop = destination IP",
+                 ip_octets_equal_public(&q->next_hop_ip, &dst_ip_fwd));
+            TEST_MSG("ARP: Queued out_interface = 2", q->out_interface == 2,
+                     "got %d", q->out_interface);
+        }
+    }
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- ARP Reply -> Flush Pending Queue Test ---\n" ANSI_RESET);
+    // ========================================
+
+    // Test ARP reply triggers pending queue flush
+    {
+        router_pending_queue_init(&fwd_router.pending_queue);
+        arp_table_init(&fwd_router.arp_table);
+
+        // Pre-queue a pending packet for 10.0.0.5
+        IPv4Packet premade_pkt;
+        ipv4_create(&premade_pkt, src_ip_fwd, dst_ip_fwd, 64, IPV4_PROTOCOL_ICMP,
+                    icmp_payload_raw, icmp_payload_len);
+
+        RouterPendingQueue* qq = &fwd_router.pending_queue;
+        qq->items[qq->tail].next_hop_ip = dst_ip_fwd;
+        qq->items[qq->tail].out_interface = 2;
+        qq->items[qq->tail].vlan_id = 0;
+        qq->items[qq->tail].packet = premade_pkt;
+        qq->tail = (qq->tail + 1) % ROUTER_PENDING_QUEUE_MAX_ENTRIES;
+        qq->size = 1;
+
+        TEST_MSG("ARPFlush: Initial pending count", fwd_router.pending_queue.size == 1,
+                 "got %zu", fwd_router.pending_queue.size);
+
+        // Send ARP Reply claiming 10.0.0.5 has MAC
+        MacAddress dst_mac = {{0xDD, 0xDD, 0xDD, 0xDD, 0xDD, 0xDD}};
+        ARPMessage arp_reply;
+        arp_message_init_reply(&arp_reply, dst_mac, dst_ip_fwd,
+                               iface2->Mac_Address, fwd_router.interface_ips[1].ip_address);
+
+        uint8_t arp_raw[ETHERNET_VLAN_HEADER_SIZE + ETHERNET_MAX_PAYLOAD];
+        MacAddress src_mac2 = {{0xDD, 0xDD, 0xDD, 0xDD, 0xDD, 0xDD}};
+        size_t arp_raw_len = build_arp_frame(arp_raw, sizeof(arp_raw),
+                                             &iface2->Mac_Address, &src_mac2, &arp_reply);
+
+        TEST("ARPFlush: Build ARP frame succeeds", arp_raw_len > 0);
+        node_receive(&fwd_router.base, iface2, arp_raw, arp_raw_len);
+
+        // Router should learn ARP and flush pending queue
+        const MacAddress* learned = arp_table_get_const(&fwd_router.arp_table, &dst_ip_fwd);
+        TEST("ARPFlush: Router learned ARP entry", learned != NULL);
+
+        int mac_match = learned && memcmp(learned->bytes, dst_mac.bytes, 6) == 0;
+        TEST("ARPFlush: ARP MAC matches", mac_match);
+
+        TEST_MSG("ARPFlush: Pending queue flushed", fwd_router.pending_queue.size == 0,
+                 "got %zu", fwd_router.pending_queue.size);
+    }
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- ARP Hit -> Immediate Forward Test ---\n" ANSI_RESET);
+    // ========================================
+
+    // Test packet forwarding with warm ARP cache → immediate send, no queue
+    {
+        router_pending_queue_init(&fwd_router.pending_queue);
+        arp_table_init(&fwd_router.arp_table);
+
+        // Pre-populate ARP for destination
+        MacAddress dst_mac = {{0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE}};
+        arp_table_set(&fwd_router.arp_table, &dst_ip_fwd, &dst_mac);
+
+        uint8_t raw[ETHERNET_VLAN_HEADER_SIZE + ETHERNET_MAX_PAYLOAD];
+        MacAddress src_mac = {{0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC}};
+
+        size_t raw_len = build_ipv4_frame(raw, sizeof(raw), &broadcast, &src_mac,
+                                          &src_ip_fwd, &dst_ip_fwd, 64, IPV4_PROTOCOL_ICMP,
+                                          icmp_payload_raw, icmp_payload_len);
+
+        TEST("ARPHit: Build frame succeeds", raw_len > 0);
+        node_receive(&fwd_router.base, iface1, raw, raw_len);
+
+        // ARP was already resolved → no queuing needed
+        TEST_MSG("ARPHit: Pending queue empty (immediate forward)",
+                 fwd_router.pending_queue.size == 0,
+                 "got %zu", fwd_router.pending_queue.size);
+
+        // ARP table should still have the entry
+        TEST_MSG("ARPHit: ARP table still has entry",
+                 fwd_router.arp_table.size == 1,
+                 "got %zu", fwd_router.arp_table.size);
+    }
 
     test_report_footer();
 }
@@ -486,15 +1403,215 @@ void debug_milestone_3(Simulator *sim)
     test_reset();
     test_report_header("Milestone 3: Transport Layer (TCP, UDP)");
 
-    printf("\n" ANSI_YELLOW "  --- FEATURE NOT YET IMPLEMENTED ---\n" ANSI_RESET);
-    printf("  Planned tests for Milestone 3:\n");
-    printf("    - TCP segment serialization\n");
-    printf("    - UDP datagram serialization\n");
-    printf("    - TCP 3-Way Handshake (SYN -> SYN-ACK -> ACK)\n");
-    printf("    - TCP state machine transitions\n");
-    printf("    - TCP receive buffer reassembly\n");
-    printf("    - TCP 4-Way Teardown (FIN/ACK)\n");
-    printf("    - Pseudo-header checksum calculation\n\n");
+    uint8_t ip_a[] = {192, 168, 1, 10};
+    uint8_t ip_b[] = {192, 168, 1, 11};
+    IpAddress src_ip = ip_init(ip_a, 24);
+    IpAddress dst_ip = ip_init(ip_b, 24);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- UDP Datagram Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T1: UDP init
+    UDPDatagram udp;
+    udp_init(&udp);
+    TEST("UDP init sets type to UDP", udp.base.type == UDP);
+    TEST("UDP init length = header size", udp.length == UDP_HEADER_SIZE);
+
+    // T2: UDP create
+    const char* udp_data = "Hello UDP";
+    size_t udp_data_len = strlen(udp_data);
+    int r = udp_create(&udp, 1234, 5678, (const uint8_t*)udp_data, udp_data_len);
+    TEST("UDP create succeeds", r == 1);
+    TEST_MSG("UDP src_port = 1234", udp.src_port == 1234, "got %u", udp.src_port);
+    TEST_MSG("UDP dst_port = 5678", udp.dst_port == 5678, "got %u", udp.dst_port);
+    TEST_MSG("UDP payload_len = %zu", udp.payload_len == udp_data_len, "got %zu", udp.payload_len);
+
+    // T3: UDP serialization roundtrip
+    uint8_t udp_raw[UDP_HEADER_SIZE + UDP_MAX_PAYLOAD];
+    size_t udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
+    TEST_MSG("UDP to_bytes length = 8 + payload", udp_len == UDP_HEADER_SIZE + udp_data_len, "got %zu", udp_len);
+
+    UDPDatagram udp2;
+    udp_init(&udp2);
+    r = packet_from_bytes((Packet*)&udp2, udp_raw, udp_len);
+    TEST("UDP from_bytes succeeds", r == 1);
+    TEST_MSG("UDP roundtrip src_port", udp2.src_port == 1234, "got %u", udp2.src_port);
+    TEST_MSG("UDP roundtrip dst_port", udp2.dst_port == 5678, "got %u", udp2.dst_port);
+    TEST_MSG("UDP roundtrip payload_len", udp2.payload_len == udp_data_len, "got %zu", udp2.payload_len);
+
+    // T4: UDP checksum with pseudo-header
+    udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
+    uint16_t cksum = udp_compute_checksum(udp_raw, udp_len, &src_ip, &dst_ip);
+    udp.checksum = cksum;
+    bool valid = udp_validate_checksum(&udp, &src_ip, &dst_ip);
+    TEST("UDP checksum valid with correct pseudo-header", valid);
+
+    // T5: UDP checksum fails with wrong IP
+    IpAddress wrong_ip = ip_init(ip_b, 24);
+    bool invalid = udp_validate_checksum(&udp, &wrong_ip, &dst_ip);
+    TEST("UDP checksum fails with wrong src IP", !invalid);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- TCP Segment Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T6: TCP init
+    TCPSegment tcp;
+    tcp_init(&tcp);
+    TEST("TCP init type = TCP", tcp.base.type == TCP);
+    TEST("TCP init data_offset = 5", tcp.data_offset == 5);
+    TEST_MSG("TCP init window = %u", tcp.window == TCP_WINDOW_SIZE, "got %u", tcp.window);
+
+    // T7: TCP create (SYN)
+    r = tcp_create(&tcp, 1000, 80, 100, 0, TCP_FLAG_SYN, TCP_WINDOW_SIZE, NULL, 0);
+    TEST("TCP create SYN succeeds", r == 1);
+    TEST_MSG("TCP src_port = 1000", tcp.src_port == 1000, "got %u", tcp.src_port);
+    TEST("TCP SYN flag set", tcp.flags == TCP_FLAG_SYN);
+    TEST_MSG("TCP seq_num = 100", tcp.seq_num == 100, "got %u", tcp.seq_num);
+
+    // T8: TCP serialization roundtrip
+    uint8_t tcp_raw[TCP_HEADER_SIZE + TCP_MAX_PAYLOAD];
+    size_t tcp_len = packet_to_bytes((Packet*)&tcp, tcp_raw, sizeof(tcp_raw));
+    TEST_MSG("TCP to_bytes length = 20", tcp_len == TCP_HEADER_SIZE, "got %zu", tcp_len);
+
+    TCPSegment tcp2;
+    tcp_init(&tcp2);
+    r = packet_from_bytes((Packet*)&tcp2, tcp_raw, tcp_len);
+    TEST("TCP from_bytes succeeds", r == 1);
+    TEST_MSG("TCP roundtrip src_port", tcp2.src_port == 1000, "got %u", tcp2.src_port);
+    TEST("TCP roundtrip SYN flag", tcp2.flags & TCP_FLAG_SYN);
+    TEST("TCP roundtrip NOT ACK flag", !(tcp2.flags & TCP_FLAG_ACK));
+
+    // T9: TCP checksum with pseudo-header
+    tcp_len = packet_to_bytes((Packet*)&tcp, tcp_raw, sizeof(tcp_raw));
+    uint16_t tcp_cksum = tcp_compute_checksum(tcp_raw, tcp_len, &src_ip, &dst_ip);
+    tcp.checksum = tcp_cksum;
+    valid = tcp_validate_checksum(&tcp, &src_ip, &dst_ip);
+    TEST("TCP checksum valid with correct pseudo-header", valid);
+
+    invalid = tcp_validate_checksum(&tcp, &wrong_ip, &dst_ip);
+    TEST("TCP checksum fails with wrong src IP", !invalid);
+
+    // T10: TCP with payload
+    const char* tcp_data = "Hello TCP World";
+    size_t tcp_data_len = strlen(tcp_data);
+    r = tcp_create(&tcp, 1000, 80, 200, 150, TCP_FLAG_ACK | TCP_FLAG_PSH,
+                   TCP_WINDOW_SIZE, (const uint8_t*)tcp_data, tcp_data_len);
+    TEST("TCP create with data succeeds", r == 1);
+    TEST("TCP PSH and ACK flags set", tcp.flags == (TCP_FLAG_ACK | TCP_FLAG_PSH));
+    TEST_MSG("TCP payload_len = %zu", tcp.payload_len == tcp_data_len, "got %zu", tcp.payload_len);
+
+    tcp_len = packet_to_bytes((Packet*)&tcp, tcp_raw, sizeof(tcp_raw));
+    TEST_MSG("TCP to_bytes with payload", tcp_len == TCP_HEADER_SIZE + tcp_data_len, "got %zu", tcp_len);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- TCP Socket & State Machine Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T11: Socket init
+    TCPSocket sockets[TCP_MAX_SOCKETS];
+    tcp_socket_init(sockets, TCP_MAX_SOCKETS);
+    int idx = tcp_socket_alloc(sockets, TCP_MAX_SOCKETS);
+    TEST("Socket alloc returns valid index", idx >= 0);
+    TEST("Allocated socket is in_use", sockets[idx].in_use);
+    TEST("Allocated socket starts CLOSED", sockets[idx].state == TCP_CLOSED);
+
+    // T12: TCP connect
+    TCPSocket* client = &sockets[idx];
+    r = tcp_socket_connect(client, &src_ip, 12345, &dst_ip, 80);
+    TEST("TCP connect succeeds", r == 1);
+    TEST("TCP state after connect = SYN_SENT", client->state == TCP_SYN_SENT);
+    TEST_MSG("local_port = 12345", client->local_port == 12345, "got %u", client->local_port);
+    TEST_MSG("remote_port = 80", client->remote_port == 80, "got %u", client->remote_port);
+    TEST_MSG("send_seq = 1000", client->send_seq == 1000, "got %u", client->send_seq);
+
+    // T13: TCP listen
+    int listen_idx = tcp_socket_alloc(sockets, TCP_MAX_SOCKETS);
+    TCPSocket* server = &sockets[listen_idx];
+    r = tcp_socket_listen(server, &dst_ip, 80);
+    TEST("TCP listen succeeds", r == 1);
+    TEST("TCP state after listen = LISTEN", server->state == TCP_LISTEN);
+    TEST("is_listening = true", server->is_listening);
+
+    // T14: Socket find (match by local port for listening socket)
+    TCPSocket* found = tcp_socket_find(sockets, TCP_MAX_SOCKETS, &dst_ip, 80, &src_ip, 12345);
+    TEST("Find listening socket by local port", found == server);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- TCP 3-Way Handshake Test ---\n" ANSI_RESET);
+    // ========================================
+
+    // Simulate 3-way handshake between client and server
+    // Step 1: Client sends SYN
+    // (Client is already in SYN_SENT state)
+
+    // Step 2: Server receives SYN -> sends SYN-ACK
+    TCPSegment syn_seg;
+    tcp_create(&syn_seg, 12345, 80, 1000, 0, TCP_FLAG_SYN, TCP_WINDOW_SIZE, NULL, 0);
+
+    // Compute checksum for syn_seg (needed for tcp_socket_receive_segment validation)
+    {
+        uint8_t seg_raw[TCP_HEADER_SIZE];
+        size_t seg_len = packet_to_bytes((Packet*)&syn_seg, seg_raw, sizeof(seg_raw));
+        syn_seg.checksum = tcp_compute_checksum(seg_raw, seg_len, &src_ip, &dst_ip);
+    }
+
+    TCPSegment syn_ack_response;
+    tcp_init(&syn_ack_response);
+
+    // Server receives SYN
+    r = tcp_socket_receive_segment(server, &syn_seg, &src_ip, &dst_ip, &syn_ack_response);
+    TEST("Server handles SYN from LISTEN", r == 1);
+    TEST("Server state = SYN_RECEIVED after SYN", server->state == TCP_SYN_RECEIVED);
+    TEST("Server responds with SYN-ACK", syn_ack_response.flags == TCP_FLAG_SYN_ACK);
+    TEST("Server ack_num = client_seq + 1", syn_ack_response.ack_num == 1001);
+
+    // Step 3: Client receives SYN-ACK -> sends ACK
+    // First, allocate a child socket for the client side
+    int child_idx = tcp_socket_alloc(sockets, TCP_MAX_SOCKETS);
+    TCPSocket* child = &sockets[child_idx];
+    // Set up as client connecting TO dst_ip:80 FROM src_ip:12345
+    tcp_socket_connect(child, &src_ip, 12345, &dst_ip, 80);
+    child->state = TCP_SYN_SENT;
+    child->send_seq = 2000;
+    child->recv_seq = 0;
+
+    TCPSegment ack_response;
+    tcp_init(&ack_response);
+    r = tcp_socket_receive_segment(child, &syn_ack_response, &dst_ip, &src_ip, &ack_response);
+    TEST("Client handles SYN-ACK", r == 1);
+    TEST("Client state = ESTABLISHED after SYN-ACK", child->state == TCP_ESTABLISHED);
+    TEST("Client sends ACK", ack_response.flags == TCP_FLAG_ACK);
+    TEST_MSG("Client ack_num = server_seq + 1", ack_response.ack_num == syn_ack_response.seq_num + 1, "got %u", ack_response.ack_num);
+
+    // ========================================
+    printf("\n" ANSI_YELLOW "  --- TCP State Transition Tests ---\n" ANSI_RESET);
+    // ========================================
+
+    // T15: TCP state names
+    TEST("State name CLOSED", strcmp(tcp_state_name(TCP_CLOSED), "CLOSED") == 0);
+    TEST("State name ESTABLISHED", strcmp(tcp_state_name(TCP_ESTABLISHED), "ESTABLISHED") == 0);
+    TEST("State name TIME_WAIT", strcmp(tcp_state_name(TCP_TIME_WAIT), "TIME_WAIT") == 0);
+
+    // T16: TCP send/recv (no actual network - just buffer test)
+    TCPSocket* esock = child;  // Use the established socket
+    r = tcp_socket_send(esock, (const uint8_t*)"Hello", 5);
+    TEST("TCP send to established socket", r == 1);
+    TEST_MSG("Send buffer size = 5", esock->send_buffer.size == 5, "got %zu", esock->send_buffer.size);
+
+    // T17: TCP close (initiate 4-way handshake)
+    r = tcp_socket_close(esock);
+    TEST("TCP close from ESTABLISHED", r == 1);
+    TEST("State after close = FIN_WAIT_1", esock->state == TCP_FIN_WAIT_1);
+
+    // T18: TCP socket free
+    tcp_socket_free(esock);
+    TEST("Freed socket not in use", !esock->in_use);
+
+    // T19: TCP socket alloc after free
+    int re_idx = tcp_socket_alloc(sockets, TCP_MAX_SOCKETS);
+    TEST("Can re-allocate freed socket", re_idx == child_idx);
 
     test_report_footer();
 }

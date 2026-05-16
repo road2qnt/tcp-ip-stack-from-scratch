@@ -3,6 +3,8 @@
 
 #include "../core/interface.h"
 #include "../layer3/ipv4.h"
+#include "../layer4/udp.h"
+#include "../layer4/tcp_socket.h"
 #include "arp.h"
 #include "ethernet.h"
 
@@ -35,6 +37,14 @@ typedef struct Host{
     // Tambahan untuk Host (ARP Table: IP -> MAC)
     ArpTable arp_table;
     HostPendingQueue pending_queue;
+    
+    // Transport Layer (Milestone 3)
+    TCPSocket tcp_sockets[TCP_MAX_SOCKETS];
+    UDPDatagram last_udp;
+    bool has_last_udp;
+    TCPSegment last_tcp;
+    bool has_last_tcp;
+    bool tcp_data_ready;
 }Host;
 
 void host_init(Host* host, int num_interfaces);

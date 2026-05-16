@@ -1,6 +1,9 @@
 #include "host.h"
 #include "../core/packet.h"
 #include "../layer3/icmp.h"
+#include "../layer4/udp.h"
+#include "../layer4/tcp.h"
+#include "../layer4/tcp_socket.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -234,68 +237,179 @@ static void host_receive(Node* self, Interface* in_interface, const uint8_t* raw
             return;
         }
 
-        if (ip_packet.protocol != IPV4_PROTOCOL_ICMP) {
-            printf("[%s] IPv4 protocol %u not supported\n", host->base.NAME, ip_packet.protocol);
+        if (ip_packet.protocol == IPV4_PROTOCOL_UDP) {
+            UDPDatagram udp;
+            
+            udp_init(&udp);
+            if (!packet_from_bytes((Packet*)&udp, ip_packet.payload, ip_packet.payload_len) ||
+                !udp_validate_checksum(&udp, &ip_packet.src_ip, &ip_packet.dst_ip)) {
+                printf("[%s] Dropped invalid UDP datagram\n", host->base.NAME);
+                return;
+            }
+
+            printf("[%s] UDP datagram received: %u -> %u (%zu bytes)\n",
+                   host->base.NAME, udp.src_port, udp.dst_port, udp.payload_len);
+            
+            host->last_udp = udp;
+            host->has_last_udp = true;
             return;
         }
 
-        icmp_init(&icmp);
-        if (!packet_from_bytes((Packet*)&icmp, ip_packet.payload, ip_packet.payload_len) ||
-            !icmp_validate_checksum(&icmp)) {
-            printf("[%s] Dropped invalid ICMP message\n", host->base.NAME);
-            return;
-        }
-
-        host->last_icmp_type = icmp.type;
-        host->last_icmp_source = ip_packet.src_ip;
-        host->last_icmp_sequence = icmp.sequence;
-        host->has_last_icmp = true;
-
-        if (icmp.type == ICMP_ECHO_REQUEST) {
-            ICMPMessage reply;
-            uint8_t icmp_raw[ICMP_HEADER_SIZE + ICMP_MAX_PAYLOAD];
-            size_t icmp_len;
-            IPv4Packet response;
+        if (ip_packet.protocol == IPV4_PROTOCOL_TCP) {
+            TCPSegment tcp_seg;
+            TCPSegment tcp_response;
+            uint8_t response_raw[TCP_HEADER_SIZE];
+            size_t response_len;
+            IPv4Packet response_ip;
             uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
             size_t ip_len;
-
-            printf("[%s] ICMP Echo Request received from ", host->base.NAME);
-            print_ip_address(&ip_packet.src_ip);
-            printf("\n");
-
-            if (!icmp_create(&reply, ICMP_ECHO_REPLY, 0, icmp.identifier, icmp.sequence,
-                             icmp.payload, icmp.payload_len)) {
+            
+            tcp_init(&tcp_seg);
+            if (!packet_from_bytes((Packet*)&tcp_seg, ip_packet.payload, ip_packet.payload_len)) {
+                printf("[%s] Dropped invalid TCP segment\n", host->base.NAME);
                 return;
             }
 
-            icmp_len = packet_to_bytes((Packet*)&reply, icmp_raw, sizeof(icmp_raw));
-            if (icmp_len == 0 ||
-                !ipv4_create(&response, host->ip_address, ip_packet.src_ip, IPV4_DEFAULT_TTL,
-                             IPV4_PROTOCOL_ICMP, icmp_raw, icmp_len)) {
+            printf("[%s] TCP segment received: %u -> %u flags=0x%02x seq=%u\n",
+                   host->base.NAME, tcp_seg.src_port, tcp_seg.dst_port,
+                   tcp_seg.flags, tcp_seg.seq_num);
+
+            // Find matching socket (established or listening)
+            TCPSocket* socket = tcp_socket_find(
+                host->tcp_sockets, TCP_MAX_SOCKETS,
+                &host->ip_address, tcp_seg.dst_port,
+                &ip_packet.src_ip, tcp_seg.src_port);
+
+            if (socket == NULL) {
+                printf("[%s] No matching TCP socket for %u -> %u\n",
+                       host->base.NAME, tcp_seg.src_port, tcp_seg.dst_port);
                 return;
             }
 
-            ip_len = packet_to_bytes((Packet*)&response, ip_raw, sizeof(ip_raw));
-            if (ip_len == 0) {
-                return;
+            // If listening socket received SYN, allocate child for the new connection
+            if (socket->is_listening && (tcp_seg.flags & TCP_FLAG_SYN)) {
+                int child_idx = tcp_socket_alloc(host->tcp_sockets, TCP_MAX_SOCKETS);
+                if (child_idx >= 0) {
+                    TCPSocket* child = &host->tcp_sockets[child_idx];
+                    child->local_ip = socket->local_ip;
+                    child->local_port = tcp_seg.dst_port;
+                    child->remote_ip = ip_packet.src_ip;
+                    child->remote_port = tcp_seg.src_port;
+                    child->state = TCP_LISTEN;
+                    child->parent = socket;
+                    socket = child;
+                } else {
+                    printf("[%s] No free TCP socket slots\n", host->base.NAME);
+                    return;
+                }
             }
 
-            host_send_l3_packet(host, &ip_packet.src_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
-        } else if (icmp.type == ICMP_ECHO_REPLY) {
-            printf("%s: Reply from ", host->base.NAME);
-            print_ip_address(&ip_packet.src_ip);
-            printf(": bytes=%zu time=0ms TTL=%u\n", icmp.payload_len, ip_packet.ttl);
-        } else if (icmp.type == ICMP_TIME_EXCEEDED) {
-            printf("%s: ICMP Time Exceeded from ", host->base.NAME);
-            print_ip_address(&ip_packet.src_ip);
-            printf("\n");
-        } else if (icmp.type == ICMP_DEST_UNREACHABLE) {
-            printf("%s: ICMP Destination Unreachable from ", host->base.NAME);
-            print_ip_address(&ip_packet.src_ip);
-            printf("\n");
-        } else {
-            printf("[%s] ICMP type %u received\n", host->base.NAME, icmp.type);
+            tcp_init(&tcp_response);
+            if (tcp_socket_receive_segment(socket, &tcp_seg,
+                                           &ip_packet.src_ip, &ip_packet.dst_ip,
+                                           &tcp_response)) {
+                // Store the last TCP info for CLI queries
+                host->last_tcp = tcp_seg;
+                host->has_last_tcp = true;
+
+                // Send response if generated (e.g., SYN-ACK, ACK)
+                if (tcp_response.flags != 0 && tcp_response.src_port > 0) {
+                    response_len = packet_to_bytes((Packet*)&tcp_response, response_raw, sizeof(response_raw));
+                    if (response_len > 0) {
+                        // Recompute checksum
+                        tcp_response.checksum = tcp_compute_checksum(
+                            response_raw, response_len,
+                            &host->ip_address, &ip_packet.src_ip);
+                        response_len = packet_to_bytes((Packet*)&tcp_response, response_raw, sizeof(response_raw));
+
+                        if (ipv4_create(&response_ip, host->ip_address, ip_packet.src_ip,
+                                        IPV4_DEFAULT_TTL, IPV4_PROTOCOL_TCP,
+                                        response_raw, response_len)) {
+                            ip_len = packet_to_bytes((Packet*)&response_ip, ip_raw, sizeof(ip_raw));
+                            if (ip_len > 0) {
+                                host_send_l3_packet(host, &ip_packet.src_ip,
+                                                     ETHERNET_TYPE_IPV4, ip_raw, ip_len);
+                            }
+                        }
+                    }
+                }
+            }
+            return;
         }
+
+        // Handle ICMP echo requests/replies and other ICMP types
+        if (ip_packet.protocol == IPV4_PROTOCOL_ICMP) {
+            icmp_init(&icmp);
+            if (!packet_from_bytes((Packet*)&icmp, ip_packet.payload, ip_packet.payload_len) ||
+                !icmp_validate_checksum(&icmp)) {
+                printf("[%s] Dropped invalid ICMP message\n", host->base.NAME);
+                return;
+            }
+
+            host->last_icmp_type = icmp.type;
+            host->last_icmp_source = ip_packet.src_ip;
+            host->last_icmp_sequence = icmp.sequence;
+            host->has_last_icmp = true;
+
+            if (icmp.type == ICMP_ECHO_REQUEST) {
+                ICMPMessage reply;
+                uint8_t icmp_raw[ICMP_HEADER_SIZE + ICMP_MAX_PAYLOAD];
+                size_t icmp_len;
+                IPv4Packet response;
+                uint8_t ip_raw2[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
+                size_t ip_len2;
+
+                printf("[%s] ICMP Echo Request received from ", host->base.NAME);
+                print_ip_address(&ip_packet.src_ip);
+                printf("\n");
+
+                if (!icmp_create(&reply, ICMP_ECHO_REPLY, 0, icmp.identifier, icmp.sequence,
+                                 icmp.payload, icmp.payload_len)) {
+                    return;
+                }
+
+                icmp_len = packet_to_bytes((Packet*)&reply, icmp_raw, sizeof(icmp_raw));
+                if (icmp_len == 0 ||
+                    !ipv4_create(&response, host->ip_address, ip_packet.src_ip, IPV4_DEFAULT_TTL,
+                                 IPV4_PROTOCOL_ICMP, icmp_raw, icmp_len)) {
+                    return;
+                }
+
+                ip_len2 = packet_to_bytes((Packet*)&response, ip_raw2, sizeof(ip_raw2));
+                if (ip_len2 == 0) {
+                    return;
+                }
+
+                host_send_l3_packet(host, &ip_packet.src_ip, ETHERNET_TYPE_IPV4, ip_raw2, ip_len2);
+                return;
+            }
+
+            if (icmp.type == ICMP_ECHO_REPLY) {
+                printf("%s: Reply from ", host->base.NAME);
+                print_ip_address(&ip_packet.src_ip);
+                printf(": bytes=%zu time=0ms TTL=%u\n", icmp.payload_len, ip_packet.ttl);
+                return;
+            }
+
+            if (icmp.type == ICMP_TIME_EXCEEDED) {
+                printf("%s: ICMP Time Exceeded from ", host->base.NAME);
+                print_ip_address(&ip_packet.src_ip);
+                printf("\n");
+                return;
+            }
+
+            if (icmp.type == ICMP_DEST_UNREACHABLE) {
+                printf("%s: ICMP Destination Unreachable from ", host->base.NAME);
+                print_ip_address(&ip_packet.src_ip);
+                printf("\n");
+                return;
+            }
+
+            printf("[%s] ICMP type %u received\n", host->base.NAME, icmp.type);
+            return;
+        }
+
+        printf("[%s] Unsupported IPv4 protocol %u\n", host->base.NAME, ip_packet.protocol);
         return;
     }
 
@@ -323,8 +437,12 @@ void host_init_with_macs(Host* host, int num_interfaces, const MacAddress* mac_a
     host->has_last_icmp = false;
     host->last_icmp_type = 0;
     host->last_icmp_sequence = 0;
+    host->has_last_udp = false;
+    host->has_last_tcp = false;
+    host->tcp_data_ready = false;
     arp_table_init(&host->arp_table);
     host_pending_queue_init(&host->pending_queue);
+    tcp_socket_init(host->tcp_sockets, TCP_MAX_SOCKETS);
 }
 
 void host_pending_queue_init(HostPendingQueue* queue)
