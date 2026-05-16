@@ -13,8 +13,13 @@ SRCS := \
 	magi_system/layer2/host.c \
 	magi_system/layer2/switch.c \
 	magi_system/layer2/arp.c \
+	magi_system/layer2/ethernet.c \
 	magi_system/layer3/ipv4.c \
+	magi_system/layer3/icmp.c \
 	magi_system/layer3/router.c \
+	magi_system/layer4/udp.c \
+	magi_system/layer4/tcp.c \
+	magi_system/layer4/tcp_socket.c \
 	magi_system/utils/cli.c \
 	magi_system/utils/json.c \
 	magi_system/utils/loader.c \
