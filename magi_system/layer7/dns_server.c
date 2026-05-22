@@ -1,10 +1,13 @@
 #include "dns_server.h"
+#include "../layer2/host.h"
+#include "../core/packet.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
 static DNSEntry g_dns_table[DNS_MAX_ENTRIES];
 static int g_dns_entry_count = 0;
+static Host* g_bound_host = NULL;
 
 int dns_server_init(void)
 {
@@ -347,4 +350,67 @@ int dns_server_handle_query(const uint8_t* query, size_t query_len,
 
     *resp_len = resp_pos;
     return 1;
+}
+
+int dns_server_attach_host(Host* host)
+{
+    if (host == NULL) return 0;
+    g_bound_host = host;
+    if (g_dns_entry_count == 0) dns_server_init();
+    return 1;
+}
+
+int dns_server_detach_host(void)
+{
+    g_bound_host = NULL;
+    return 1;
+}
+
+Host* dns_server_get_bound_host(void)
+{
+    return g_bound_host;
+}
+
+static int dns_send_response(Host* host,
+                              const uint8_t* response, size_t response_len,
+                              const IpAddress* dst_ip, uint16_t dst_port)
+{
+    if (host == NULL || response == NULL || dst_ip == NULL) return 0;
+
+    UDPDatagram udp;
+    udp_init(&udp);
+    udp_create(&udp, DNS_SERVER_PORT, dst_port, response, response_len);
+
+    uint8_t udp_raw[UDP_HEADER_SIZE + UDP_MAX_PAYLOAD];
+    size_t udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
+    if (udp_len == 0) return 0;
+    udp.checksum = udp_compute_checksum(udp_raw, udp_len, &host->ip_address, dst_ip);
+    udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
+
+    uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
+    IPv4Packet ip_pkt;
+    if (!ipv4_create(&ip_pkt, host->ip_address, *dst_ip,
+                     IPV4_DEFAULT_TTL, IPV4_PROTOCOL_UDP, udp_raw, udp_len)) {
+        return 0;
+    }
+    size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
+    if (ip_len == 0) return 0;
+
+    return host_send_l3_packet(host, dst_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
+}
+
+int dns_server_dispatch(Host* host, const UDPDatagram* request,
+                         const IpAddress* src_ip, uint16_t src_port)
+{
+    if (host == NULL || request == NULL || src_ip == NULL) return 0;
+    if (g_bound_host != host) return 0;
+
+    uint8_t response[1024];
+    size_t resp_len = 0;
+    if (!dns_server_handle_query(request->payload, request->payload_len,
+                                  response, &resp_len, sizeof(response))) {
+        return 0;
+    }
+
+    return dns_send_response(host, response, resp_len, src_ip, src_port);
 }

@@ -42,21 +42,24 @@ TCPSocket* tcp_socket_find(TCPSocket* sockets, size_t count,
 
     for (size_t i = 0; i < count; i++) {
         if (!sockets[i].in_use) continue;
-
-        // Check for matching or listening socket
+        if (sockets[i].is_listening) continue;
         if (ip_octets_equal_public(&sockets[i].local_ip, local_ip) &&
-            sockets[i].local_port == local_port) {
-            // Full match (established connection)
-            if (ip_octets_equal_public(&sockets[i].remote_ip, remote_ip) &&
-                sockets[i].remote_port == remote_port) {
-                return &sockets[i];
-            }
-            // Or it's a listening socket
-            if (sockets[i].is_listening) {
-                return &sockets[i];
-            }
+            sockets[i].local_port == local_port &&
+            ip_octets_equal_public(&sockets[i].remote_ip, remote_ip) &&
+            sockets[i].remote_port == remote_port) {
+            return &sockets[i];
         }
     }
+
+    for (size_t i = 0; i < count; i++) {
+        if (!sockets[i].in_use) continue;
+        if (!sockets[i].is_listening) continue;
+        if (ip_octets_equal_public(&sockets[i].local_ip, local_ip) &&
+            sockets[i].local_port == local_port) {
+            return &sockets[i];
+        }
+    }
+
     return NULL;
 }
 
@@ -282,38 +285,34 @@ int tcp_socket_receive_segment(TCPSocket* socket, const TCPSegment* segment,
         }
 
         case TCP_SYN_RECEIVED: {
-            // Received ACK → ESTABLISHED
             if (segment->flags & TCP_FLAG_ACK) {
                 socket->send_ack = segment->ack_num;
-                socket->recv_seq = segment->seq_num;  // Data after ACK starts here
+                socket->recv_seq = segment->seq_num;
                 socket->state = TCP_ESTABLISHED;
                 printf("[TCP] SYN_RECEIVED: Received ACK, socket -> ESTABLISHED!\n");
 
-                // If there's data, deliver it
                 if (segment->payload_len > 0) {
                     size_t copy_len = segment->payload_len < TCP_MAX_PAYLOAD ? segment->payload_len : TCP_MAX_PAYLOAD;
                     memcpy(socket->last_payload, segment->payload, copy_len);
                     socket->last_payload_len = copy_len;
                     socket->has_data = true;
                     socket->recv_seq = segment->seq_num + segment->payload_len;
-
                     printf("[TCP] Received %zu bytes of data\n", copy_len);
-                }
 
-                // Send ACK for data
-                tcp_init(response);
-                response->src_port = segment->dst_port;
-                response->dst_port = segment->src_port;
-                response->seq_num = socket->send_seq;
-                response->ack_num = socket->recv_seq;
-                response->flags = TCP_FLAG_ACK;
-                response->window = TCP_WINDOW_SIZE;
+                    tcp_init(response);
+                    response->src_port = segment->dst_port;
+                    response->dst_port = segment->src_port;
+                    response->seq_num = socket->send_seq;
+                    response->ack_num = socket->recv_seq;
+                    response->flags = TCP_FLAG_ACK;
+                    response->window = TCP_WINDOW_SIZE;
 
-                uint8_t raw[TCP_HEADER_SIZE];
-                size_t raw_len = tcp_to_bytes(response, raw, sizeof(raw));
-                if (raw_len > 0) {
-                    response->checksum = tcp_compute_checksum(raw, raw_len,
-                                                              &socket->local_ip, &socket->remote_ip);
+                    uint8_t raw[TCP_HEADER_SIZE];
+                    size_t raw_len = tcp_to_bytes(response, raw, sizeof(raw));
+                    if (raw_len > 0) {
+                        response->checksum = tcp_compute_checksum(raw, raw_len,
+                                                                  &socket->local_ip, &socket->remote_ip);
+                    }
                 }
                 return 1;
             }
@@ -348,20 +347,18 @@ int tcp_socket_receive_segment(TCPSocket* socket, const TCPSegment* segment,
             }
 
             if (segment->flags & TCP_FLAG_ACK) {
-                // Handle data
+                bool had_data = false;
                 if (segment->payload_len > 0) {
                     size_t copy_len = segment->payload_len < TCP_MAX_PAYLOAD ? segment->payload_len : TCP_MAX_PAYLOAD;
                     memcpy(socket->last_payload, segment->payload, copy_len);
                     socket->last_payload_len = copy_len;
                     socket->has_data = true;
                     socket->recv_seq = segment->seq_num + segment->payload_len;
-
+                    had_data = true;
                     printf("[TCP] Received %zu bytes of data (seq=%u)\n", copy_len, segment->seq_num);
                 }
 
-                // Handle send buffer flush (ACK for data we sent)
                 if (segment->ack_num > socket->send_ack && socket->send_buffer.size > 0) {
-                    // Determine how many bytes were acked
                     uint32_t acked = segment->ack_num - socket->send_ack;
                     if (acked > socket->send_buffer.size) {
                         acked = (uint32_t)socket->send_buffer.size;
@@ -380,7 +377,10 @@ int tcp_socket_receive_segment(TCPSocket* socket, const TCPSegment* segment,
 
                 socket->send_ack = segment->ack_num;
 
-                // Send ACK
+                if (!had_data) {
+                    return 1;
+                }
+
                 tcp_init(response);
                 response->src_port = socket->local_port;
                 response->dst_port = socket->remote_port;

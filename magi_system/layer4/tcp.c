@@ -198,7 +198,7 @@ size_t tcp_to_bytes(const TCPSegment* segment, uint8_t* out, size_t out_size)
     out[12] = (uint8_t)(segment->data_offset << 4);  // upper 4 bits
     out[13] = segment->flags;
     write_u16_be(out + 14, segment->window);
-    write_u16_be(out + 16, 0);  // checksum placeholder
+    write_u16_be(out + 16, segment->checksum);
     write_u16_be(out + 18, segment->urgent_ptr);
 
     if (segment->payload_len > 0) {

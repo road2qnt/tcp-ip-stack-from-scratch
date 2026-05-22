@@ -5,6 +5,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "../layer3/ipv4.h"
+#include "../layer4/udp.h"
+
+typedef struct Host Host;
 
 #define DNS_SERVER_PORT 53
 #define DNS_MAX_NAME 256
@@ -89,5 +92,10 @@ int dns_create_query(uint8_t* out, size_t out_size, size_t* query_len,
 
 // Parse DNS response to extract IP
 int dns_parse_response(const uint8_t* raw, size_t raw_len, IpAddress* out_ip);
+
+int dns_server_attach_host(Host* host);
+int dns_server_detach_host(void);
+Host* dns_server_get_bound_host(void);
+int dns_server_dispatch(Host* host, const UDPDatagram* request, const IpAddress* src_ip, uint16_t src_port);
 
 #endif

@@ -5,6 +5,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "../layer3/ipv4.h"
+#include "../layer4/udp.h"
+
+typedef struct Host Host;
 
 #define DHCP_SERVER_PORT 67
 #define DHCP_CLIENT_PORT 68
@@ -100,5 +103,10 @@ int dhcp_get_lease(const uint8_t* mac, IpAddress* out_ip);
 
 // Get server's IP address (the host running the DHCP server)
 void dhcp_server_set_ip(const IpAddress* ip);
+
+int dhcp_server_attach_host(Host* host);
+int dhcp_server_detach_host(void);
+Host* dhcp_server_get_bound_host(void);
+int dhcp_server_dispatch(Host* host, const UDPDatagram* request, const IpAddress* src_ip);
 
 #endif

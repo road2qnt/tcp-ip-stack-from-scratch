@@ -5,14 +5,18 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "../layer3/ipv4.h"
+#include "../layer4/tcp_socket.h"
 
 #define HTTP_SERVER_PORT 80
 #define HTTP_BUFFER_SIZE 4096
 
-// HTTP server state
+typedef struct Host Host;
+
 typedef struct HTTPServer {
     bool running;
     char root_dir[256];
+    Host* bound_host;
+    int listen_sockfd;
 } HTTPServer;
 
 // Initialize the HTTP server
@@ -46,5 +50,9 @@ int http_build_response(int status_code, const char* status_text,
 
 // Serve a simple static page
 int http_serve_default(const char* path, char* response, size_t* resp_len, size_t max_resp_len);
+
+int http_server_attach_host(Host* host);
+Host* http_server_get_bound_host(void);
+int http_server_dispatch(Host* host, TCPSocket* socket);
 
 #endif

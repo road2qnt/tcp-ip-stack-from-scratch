@@ -1,13 +1,15 @@
 #include "dhcp_server.h"
+#include "../layer2/host.h"
+#include "../core/packet.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
-// DHCP server state
 static DHCPClient g_clients[DHCP_MAX_CLIENTS];
-static int g_next_ip_octet = 20;  // Start allocating from .20
+static int g_next_ip_octet = 20;
 static IpAddress g_server_ip;
 static bool g_server_ip_set = false;
+static Host* g_bound_host = NULL;
 
 // Helper: write 32-bit in network byte order
 static void write_u32_be(uint8_t* out, uint32_t value)
@@ -386,4 +388,86 @@ int dhcp_message_from_bytes(DHCPMessage* msg, const uint8_t* raw, size_t raw_len
     memcpy(msg->options, raw + 240, msg->options_len);
 
     return 1;
+}
+
+int dhcp_server_attach_host(Host* host)
+{
+    if (host == NULL) return 0;
+    g_bound_host = host;
+    if (host->has_ip) {
+        dhcp_server_set_ip(&host->ip_address);
+    }
+    dhcp_server_init();
+    return 1;
+}
+
+int dhcp_server_detach_host(void)
+{
+    g_bound_host = NULL;
+    return 1;
+}
+
+Host* dhcp_server_get_bound_host(void)
+{
+    return g_bound_host;
+}
+
+static int dhcp_send_response(Host* host, const DHCPMessage* response)
+{
+    if (host == NULL || response == NULL) return 0;
+
+    uint8_t dhcp_raw[DHCP_HEADER_SIZE + DHCP_OPTIONS_SIZE];
+    int dhcp_len = dhcp_message_to_bytes(response, dhcp_raw, sizeof(dhcp_raw));
+    if (dhcp_len <= 0) return 0;
+
+    uint8_t bcast[] = {255, 255, 255, 255};
+    IpAddress broadcast_ip = ip_init(bcast, 0);
+
+    UDPDatagram udp;
+    udp_init(&udp);
+    udp_create(&udp, DHCP_SERVER_PORT, DHCP_CLIENT_PORT, dhcp_raw, (size_t)dhcp_len);
+
+    uint8_t udp_raw[UDP_HEADER_SIZE + UDP_MAX_PAYLOAD];
+    size_t udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
+    if (udp_len == 0) return 0;
+    udp.checksum = udp_compute_checksum(udp_raw, udp_len, &host->ip_address, &broadcast_ip);
+    udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
+
+    uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
+    IPv4Packet ip_pkt;
+    if (!ipv4_create(&ip_pkt, host->ip_address, broadcast_ip,
+                     IPV4_DEFAULT_TTL, IPV4_PROTOCOL_UDP, udp_raw, udp_len)) {
+        return 0;
+    }
+    size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
+    if (ip_len == 0) return 0;
+
+    return host_send_l3_packet(host, &broadcast_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
+}
+
+int dhcp_server_dispatch(Host* host, const UDPDatagram* request, const IpAddress* src_ip)
+{
+    (void)src_ip;
+    if (host == NULL || request == NULL) return 0;
+    if (g_bound_host != host) return 0;
+
+    DHCPMessage incoming;
+    if (!dhcp_message_from_bytes(&incoming, request->payload, request->payload_len)) {
+        return 0;
+    }
+
+    int msg_type = dhcp_get_msg_type(&incoming);
+    DHCPMessage response;
+    int ok = 0;
+
+    if (msg_type == DHCP_DISCOVER) {
+        ok = dhcp_server_handle_discover(&incoming, &response);
+    } else if (msg_type == DHCP_REQUEST) {
+        ok = dhcp_server_handle_request(&incoming, &response);
+    } else {
+        return 0;
+    }
+
+    if (!ok) return 0;
+    return dhcp_send_response(host, &response);
 }

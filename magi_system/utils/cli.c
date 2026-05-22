@@ -3,6 +3,7 @@
 #include "visualizer.h"
 #include "debugger.h"
 #include "../layer2/host.h"
+#include "../layer2/switch.h"
 #include "../layer3/router.h"
 #include "../layer3/icmp.h"
 #include "../layer4/udp.h"
@@ -28,6 +29,8 @@ static void print_help(void)
     printf("  <host> ping <ip|host>\n");
     printf("  <host> traceroute <ip|host>\n");
     printf("  <router> route\n");
+    printf("  <switch> mac\n");
+    printf("  <host|router> arp\n");
     printf("  <host> tcp_connect <ip> <port>\n");
     printf("  <host> tcp_listen <port>\n");
     printf("  <host> tcp_send <data>\n");
@@ -40,7 +43,11 @@ static void print_help(void)
     printf("  <host> magi_sock_recv\n");
     printf("  <host> magi_sock_close\n");
     printf("  <host> dhcp_discover\n");
-    printf("  <host> dns_resolve <hostname>\n");
+    printf("  <host> dhcp_server start\n");
+    printf("  <host> dhcp_server stop\n");
+    printf("  <host> dns_resolve <hostname> [server_ip]\n");
+    printf("  <host> dns_server start\n");
+    printf("  <host> dns_server stop\n");
     printf("  <host> http_get <url>\n");
     printf("  <host> http_server start [dir]\n");
     printf("  <host> http_server stop\n");
@@ -100,6 +107,37 @@ static int cli_find_host(const char* name, Host** out_host)
         *out_host = (Host*)simulator.nodes[idx].node;
     }
     return 1;
+}
+
+static int dhcp_client_send_broadcast(Host* host, const uint8_t* dhcp_raw, size_t dhcp_len)
+{
+    IpAddress broadcast_ip;
+    uint8_t bcast[] = {255, 255, 255, 255};
+    broadcast_ip = ip_init(bcast, 0);
+
+    UDPDatagram udp;
+    udp_init(&udp);
+    udp_create(&udp, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, dhcp_raw, dhcp_len);
+
+    uint8_t udp_raw[UDP_HEADER_SIZE + UDP_MAX_PAYLOAD];
+    size_t udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
+    if (udp_len == 0) return 0;
+
+    IpAddress src_ip = host->has_ip ? host->ip_address : broadcast_ip;
+    udp.checksum = udp_compute_checksum(udp_raw, udp_len, &src_ip, &broadcast_ip);
+    udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
+
+    uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
+    IPv4Packet ip_pkt;
+    if (!ipv4_create(&ip_pkt, src_ip, broadcast_ip,
+                     IPV4_DEFAULT_TTL, IPV4_PROTOCOL_UDP, udp_raw, udp_len)) {
+        return 0;
+    }
+    size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
+    if (ip_len == 0) return 0;
+
+    host->has_last_udp = false;
+    return host_send_l3_packet(host, &broadcast_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
 }
 
 static int cli_find_router(const char* name, Router** out_router)
@@ -310,7 +348,7 @@ bool process(char* command){
 
             char hop[32];
             ip_to_string(&host->last_icmp_source, hop, sizeof(hop), false);
-            printf("%u  %s  0ms\n", ttl, hop);
+            printf("%u  %s  %.1fms\n", ttl, hop, host->last_icmp_rtt_ms);
             if (host->last_icmp_type == ICMP_ECHO_REPLY) {
                 break;
             }
@@ -328,6 +366,53 @@ bool process(char* command){
         }
 
         router_print_routes(router);
+        return true;
+    } else if (count >= 2 && strcmp(tokens[1], "mac") == 0) {
+        int idx = simulator_find_node(&simulator, tokens[0]);
+        if (idx < 0 || simulator.nodes[idx].type != SIM_NODE_SWITCH) {
+            printf("Unknown switch: %s\n", tokens[0]);
+            return true;
+        }
+
+        Switch* sw = (Switch*)simulator.nodes[idx].node;
+        printf("[%s] MAC Address Table (%zu entries):\n",
+               sw->base.NAME, sw->mac_table.size);
+        printf("  %-6s %-6s %-20s\n", "VLAN", "Port", "MAC Address");
+        for (size_t i = 0; i < sw->mac_table.size; i++) {
+            const SwitchMacEntry* e = &sw->mac_table.entries[i];
+            char mac_buf[20];
+            mac_to_string(&e->mac, mac_buf, sizeof(mac_buf));
+            printf("  %-6d %-6d %-20s\n", e->vlan_id, e->port_number, mac_buf);
+        }
+        return true;
+    } else if (count >= 2 && strcmp(tokens[1], "arp") == 0) {
+        int idx = simulator_find_node(&simulator, tokens[0]);
+        if (idx < 0) {
+            printf("Unknown node: %s\n", tokens[0]);
+            return true;
+        }
+
+        const ArpTable* arp = NULL;
+        const char* node_name = simulator.nodes[idx].name;
+        if (simulator.nodes[idx].type == SIM_NODE_HOST) {
+            arp = &((Host*)simulator.nodes[idx].node)->arp_table;
+        } else if (simulator.nodes[idx].type == SIM_NODE_ROUTER) {
+            arp = &((Router*)simulator.nodes[idx].node)->arp_table;
+        } else {
+            printf("ARP table only available on host or router: %s\n", tokens[0]);
+            return true;
+        }
+
+        printf("[%s] ARP Cache (%zu entries):\n", node_name, arp->size);
+        printf("  %-18s %-20s\n", "IP Address", "MAC Address");
+        for (size_t i = 0; i < arp->size; i++) {
+            const ArpTableEntry* e = &arp->entries[i];
+            char ip_buf[20];
+            char mac_buf[20];
+            ip_to_string(&e->ip, ip_buf, sizeof(ip_buf), false);
+            mac_to_string(&e->mac, mac_buf, sizeof(mac_buf));
+            printf("  %-18s %-20s\n", ip_buf, mac_buf);
+        }
         return true;
     } else if (count >= 2 && strcmp(tokens[1], "tcp_connect") == 0) {
         // <host> tcp_connect <ip> <port>
@@ -706,12 +791,42 @@ bool process(char* command){
         printf("[%s] MagiSocket closed\n", host->base.NAME);
         return true;
 
+    } else if (count >= 2 && strcmp(tokens[1], "dhcp_server") == 0) {
+        if (count < 3) {
+            printf("Usage: <host> dhcp_server start|stop\n");
+            return true;
+        }
+        if (strcmp(tokens[2], "start") == 0) {
+            Host* host;
+            if (!cli_find_host(tokens[0], &host)) {
+                printf("Unknown host: %s\n", tokens[0]);
+                return true;
+            }
+            if (!host->has_ip) {
+                printf("[DHCP] %s must have an IP before starting DHCP server\n", host->base.NAME);
+                return true;
+            }
+            if (!dhcp_server_attach_host(host)) {
+                printf("[DHCP] Failed to start DHCP server on %s\n", host->base.NAME);
+                return true;
+            }
+            char ip_buf[20];
+            ip_to_string(&host->ip_address, ip_buf, sizeof(ip_buf), false);
+            printf("[DHCP] Server started on %s (%s:%u)\n",
+                   host->base.NAME, ip_buf, DHCP_SERVER_PORT);
+        } else if (strcmp(tokens[2], "stop") == 0) {
+            dhcp_server_detach_host();
+            printf("[DHCP] Server stopped\n");
+        } else {
+            printf("Unknown dhcp_server subcommand: %s\n", tokens[2]);
+        }
+        return true;
+
     } else if (count >= 2 && strcmp(tokens[1], "dhcp_discover") == 0) {
-        // <host> dhcp_discover
         Host* host;
-        DHCPMessage discover;
+        DHCPMessage discover, request_msg, response_msg;
         uint8_t dhcp_raw[DHCP_HEADER_SIZE + DHCP_OPTIONS_SIZE];
-        size_t dhcp_len;
+        int dhcp_len;
         uint32_t xid = (uint32_t)(rand() % 100000);
 
         if (!cli_find_host(tokens[0], &host)) {
@@ -719,68 +834,188 @@ bool process(char* command){
             return true;
         }
 
-        if (!host->has_ip) {
-            printf("[DHCP] %s has no IP, using 0.0.0.0\n", host->base.NAME);
-        }
-
         printf("[%s] DHCP Discover (xid=%u)...\n", host->base.NAME, xid);
-
-        // Create discover message
         dhcp_create_discover(&discover, xid, host->base.interfaces[0].Mac_Address.bytes);
-
         dhcp_len = dhcp_message_to_bytes(&discover, dhcp_raw, sizeof(dhcp_raw));
-        if (dhcp_len == 0) {
+        if (dhcp_len <= 0) {
             printf("[DHCP] Failed to serialize discover\n");
             return true;
         }
-
-        // Send as UDP to port 67 (broadcast)
-        IpAddress broadcast_ip;
-        uint8_t bcast[] = {255, 255, 255, 255};
-        broadcast_ip = ip_init(bcast, 0);
-
-        UDPDatagram udp;
-        udp_init(&udp);
-        udp_create(&udp, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, dhcp_raw, dhcp_len);
-
-        uint8_t udp_raw[UDP_HEADER_SIZE + UDP_MAX_PAYLOAD];
-        size_t udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
-        if (udp_len > 0) {
-            IpAddress src_ip = host->has_ip ? host->ip_address : broadcast_ip;
-            udp.checksum = udp_compute_checksum(udp_raw, udp_len, &src_ip, &broadcast_ip);
-            udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
-
-            uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
-            IPv4Packet ip_pkt;
-            if (ipv4_create(&ip_pkt, src_ip, broadcast_ip,
-                            IPV4_DEFAULT_TTL, IPV4_PROTOCOL_UDP, udp_raw, udp_len)) {
-                size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
-                if (ip_len > 0) {
-                    host_send_l3_packet(host, &broadcast_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
-                    printf("[%s] DHCP Discover broadcast sent\n", host->base.NAME);
-                }
-            }
-        }
-
-        return true;
-
-    } else if (count >= 2 && strcmp(tokens[1], "dns_resolve") == 0) {
-        // <host> dns_resolve <hostname>
-        IpAddress resolved;
-
-        if (count < 3) {
-            printf("Usage: <host> dns_resolve <hostname>\n");
+        if (!dhcp_client_send_broadcast(host, dhcp_raw, (size_t)dhcp_len)) {
+            printf("[DHCP] Failed to send DISCOVER\n");
             return true;
         }
 
-        if (dns_server_resolve(tokens[2], &resolved)) {
-            char ip_buf[20];
-            ip_to_string(&resolved, ip_buf, sizeof(ip_buf), false);
-            printf("[DNS] %s -> %s\n", tokens[2], ip_buf);
-        } else {
-            printf("[DNS] Could not resolve: %s\n", tokens[2]);
+        if (!host->has_last_udp || host->last_udp.src_port != DHCP_SERVER_PORT) {
+            printf("[%s] No DHCP OFFER received\n", host->base.NAME);
+            return true;
+        }
+        if (!dhcp_message_from_bytes(&response_msg,
+                                      host->last_udp.payload,
+                                      host->last_udp.payload_len)) {
+            printf("[DHCP] Failed to parse OFFER\n");
+            return true;
+        }
+        if (dhcp_get_msg_type(&response_msg) != DHCP_OFFER) {
+            printf("[DHCP] Expected OFFER, got msg-type=%d\n", dhcp_get_msg_type(&response_msg));
+            return true;
+        }
+        IpAddress offered_ip = response_msg.yiaddr;
+        IpAddress server_ip = response_msg.siaddr;
+        char ip_buf[20];
+        ip_to_string(&offered_ip, ip_buf, sizeof(ip_buf), false);
+        printf("[%s] Received OFFER for %s\n", host->base.NAME, ip_buf);
+
+        printf("[%s] DHCP Request for %s...\n", host->base.NAME, ip_buf);
+        dhcp_create_request(&request_msg, xid,
+                            host->base.interfaces[0].Mac_Address.bytes,
+                            &offered_ip, &server_ip);
+        dhcp_len = dhcp_message_to_bytes(&request_msg, dhcp_raw, sizeof(dhcp_raw));
+        if (dhcp_len <= 0) {
+            printf("[DHCP] Failed to serialize REQUEST\n");
+            return true;
+        }
+        if (!dhcp_client_send_broadcast(host, dhcp_raw, (size_t)dhcp_len)) {
+            printf("[DHCP] Failed to send REQUEST\n");
+            return true;
         }
 
+        if (!host->has_last_udp || host->last_udp.src_port != DHCP_SERVER_PORT) {
+            printf("[%s] No DHCP ACK received\n", host->base.NAME);
+            return true;
+        }
+        if (!dhcp_message_from_bytes(&response_msg,
+                                      host->last_udp.payload,
+                                      host->last_udp.payload_len)) {
+            printf("[DHCP] Failed to parse ACK\n");
+            return true;
+        }
+        if (dhcp_get_msg_type(&response_msg) != DHCP_ACK) {
+            printf("[DHCP] Expected ACK, got msg-type=%d\n", dhcp_get_msg_type(&response_msg));
+            return true;
+        }
+
+        host->ip_address = response_msg.yiaddr;
+        host->has_ip = true;
+        ip_to_string(&host->ip_address, ip_buf, sizeof(ip_buf), false);
+        printf("[%s] DHCP lease acquired: %s\n", host->base.NAME, ip_buf);
+
+        return true;
+
+    } else if (count >= 2 && strcmp(tokens[1], "dns_server") == 0) {
+        if (count < 3) {
+            printf("Usage: <host> dns_server start|stop\n");
+            return true;
+        }
+        if (strcmp(tokens[2], "start") == 0) {
+            Host* host;
+            if (!cli_find_host(tokens[0], &host)) {
+                printf("Unknown host: %s\n", tokens[0]);
+                return true;
+            }
+            if (!host->has_ip) {
+                printf("[DNS] %s must have an IP before starting DNS server\n", host->base.NAME);
+                return true;
+            }
+            if (!dns_server_attach_host(host)) {
+                printf("[DNS] Failed to start DNS server on %s\n", host->base.NAME);
+                return true;
+            }
+            char ip_buf[20];
+            ip_to_string(&host->ip_address, ip_buf, sizeof(ip_buf), false);
+            printf("[DNS] Server started on %s (%s:%u)\n",
+                   host->base.NAME, ip_buf, DNS_SERVER_PORT);
+        } else if (strcmp(tokens[2], "stop") == 0) {
+            dns_server_detach_host();
+            printf("[DNS] Server stopped\n");
+        } else {
+            printf("Unknown dns_server subcommand: %s\n", tokens[2]);
+        }
+        return true;
+
+    } else if (count >= 2 && strcmp(tokens[1], "dns_resolve") == 0) {
+        IpAddress resolved;
+
+        if (count < 3) {
+            printf("Usage: <host> dns_resolve <hostname> [server_ip]\n");
+            return true;
+        }
+
+        if (count < 4) {
+            if (dns_server_resolve(tokens[2], &resolved)) {
+                char ip_buf[20];
+                ip_to_string(&resolved, ip_buf, sizeof(ip_buf), false);
+                printf("[DNS] %s -> %s\n", tokens[2], ip_buf);
+            } else {
+                printf("[DNS] Could not resolve: %s\n", tokens[2]);
+            }
+            return true;
+        }
+
+        Host* host;
+        IpAddress server_ip;
+        if (!cli_find_host(tokens[0], &host)) {
+            printf("Unknown host: %s\n", tokens[0]);
+            return true;
+        }
+        if (!ip_parse(tokens[3], &server_ip)) {
+            printf("Invalid server IP: %s\n", tokens[3]);
+            return true;
+        }
+
+        uint8_t query_raw[512];
+        size_t query_len = 0;
+        uint16_t query_id = (uint16_t)((rand() % 0xFFFF) + 1);
+        if (!dns_create_query(query_raw, sizeof(query_raw), &query_len, query_id, tokens[2])) {
+            printf("[DNS] Failed to build query for %s\n", tokens[2]);
+            return true;
+        }
+
+        UDPDatagram udp;
+        udp_init(&udp);
+        udp_create(&udp, 5353, DNS_SERVER_PORT, query_raw, query_len);
+
+        uint8_t udp_raw[UDP_HEADER_SIZE + UDP_MAX_PAYLOAD];
+        size_t udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
+        if (udp_len == 0) {
+            printf("[DNS] UDP serialization failed\n");
+            return true;
+        }
+        udp.checksum = udp_compute_checksum(udp_raw, udp_len, &host->ip_address, &server_ip);
+        udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
+
+        uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
+        IPv4Packet ip_pkt;
+        if (!ipv4_create(&ip_pkt, host->ip_address, server_ip,
+                         IPV4_DEFAULT_TTL, IPV4_PROTOCOL_UDP, udp_raw, udp_len)) {
+            printf("[DNS] IP packet build failed\n");
+            return true;
+        }
+        size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
+        if (ip_len == 0) {
+            printf("[DNS] IP serialization failed\n");
+            return true;
+        }
+
+        host->has_last_udp = false;
+        if (!host_send_l3_packet(host, &server_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len)) {
+            printf("[DNS] Failed to send query\n");
+            return true;
+        }
+
+        if (!host->has_last_udp || host->last_udp.src_port != DNS_SERVER_PORT) {
+            printf("[DNS] No DNS response received from %s\n", tokens[3]);
+            return true;
+        }
+
+        if (!dns_parse_response(host->last_udp.payload, host->last_udp.payload_len, &resolved)) {
+            printf("[DNS] Failed to parse response (NXDOMAIN?)\n");
+            return true;
+        }
+
+        char ip_buf[20];
+        ip_to_string(&resolved, ip_buf, sizeof(ip_buf), false);
+        printf("[DNS] %s -> %s\n", tokens[2], ip_buf);
         return true;
 
     } else if (count >= 2 && strcmp(tokens[1], "http_get") == 0) {
@@ -862,17 +1097,14 @@ bool process(char* command){
             printf("[HTTP] GET %s -> %s:%d\n", path, ip_buf, HTTP_SERVER_PORT);
         }
 
-        // If HTTP server is running on target, handle it
-        if (http_server_is_running()) {
-            char response[HTTP_BUFFER_SIZE];
-            size_t resp_len = 0;
-
-            if (http_server_handle_request(request, (size_t)req_len,
-                                            response, &resp_len, sizeof(response))) {
-                printf("\n=== HTTP Response ===\n");
-                fwrite(response, 1, resp_len > 512 ? 512 : resp_len, stdout);
-                printf("...\n=== End ===\n\n");
-            }
+        uint8_t response[HTTP_BUFFER_SIZE];
+        int resp_n = magi_recv(sockfd, response, sizeof(response));
+        if (resp_n > 0) {
+            printf("\n=== HTTP Response ===\n");
+            fwrite(response, 1, resp_n > 512 ? 512 : (size_t)resp_n, stdout);
+            printf("...\n=== End ===\n\n");
+        } else {
+            printf("[HTTP] No response received\n");
         }
 
         magi_close(sockfd);
@@ -895,6 +1127,11 @@ bool process(char* command){
 
             const char* root_dir = count >= 4 ? tokens[3] : NULL;
             http_server_start(&host->ip_address, root_dir);
+            if (!http_server_attach_host(host)) {
+                printf("[HTTP] Failed to bind listening socket on %s:80\n", tokens[0]);
+                http_server_stop();
+                return true;
+            }
             printf("[HTTP] Server started on %s:80\n", tokens[0]);
         } else if (strcmp(tokens[2], "stop") == 0) {
             if (http_server_stop()) {

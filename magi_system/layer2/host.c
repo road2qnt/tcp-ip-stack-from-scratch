@@ -4,6 +4,9 @@
 #include "../layer4/udp.h"
 #include "../layer4/tcp.h"
 #include "../layer4/tcp_socket.h"
+#include "../layer7/http_server.h"
+#include "../layer7/dhcp_server.h"
+#include "../layer7/dns_server.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -76,6 +79,23 @@ static void print_mac_address(const MacAddress* mac)
     printf("%02X:%02X:%02X:%02X:%02X:%02X",
            mac->bytes[0], mac->bytes[1], mac->bytes[2],
            mac->bytes[3], mac->bytes[4], mac->bytes[5]);
+}
+
+static double timespec_diff_ms(const struct timespec* start, const struct timespec* end)
+{
+    if (start == NULL || end == NULL) return 0.0;
+    double sec = (double)(end->tv_sec - start->tv_sec);
+    double nsec = (double)(end->tv_nsec - start->tv_nsec);
+    return sec * 1000.0 + nsec / 1000000.0;
+}
+
+static void host_record_icmp_rtt(Host* host)
+{
+    if (host == NULL || !host->icmp_in_flight) return;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    host->last_icmp_rtt_ms = timespec_diff_ms(&host->icmp_send_time, &now);
+    host->icmp_in_flight = false;
 }
 
 static int host_send_ethernet_frame(
@@ -233,7 +253,12 @@ static void host_receive(Node* self, Interface* in_interface, const uint8_t* raw
             return;
         }
 
-        if (!host->has_ip || !ip_octets_equal_public(&ip_packet.dst_ip, &host->ip_address)) {
+        bool dst_is_us = host->has_ip && ip_octets_equal_public(&ip_packet.dst_ip, &host->ip_address);
+        bool dst_is_broadcast = ip_packet.dst_ip.octet[0] == 255 &&
+                                ip_packet.dst_ip.octet[1] == 255 &&
+                                ip_packet.dst_ip.octet[2] == 255 &&
+                                ip_packet.dst_ip.octet[3] == 255;
+        if (!dst_is_us && !dst_is_broadcast) {
             return;
         }
 
@@ -252,6 +277,12 @@ static void host_receive(Node* self, Interface* in_interface, const uint8_t* raw
             
             host->last_udp = udp;
             host->has_last_udp = true;
+
+            if (udp.dst_port == DHCP_SERVER_PORT && dhcp_server_get_bound_host() == host) {
+                dhcp_server_dispatch(host, &udp, &ip_packet.src_ip);
+            } else if (udp.dst_port == DNS_SERVER_PORT && dns_server_get_bound_host() == host) {
+                dns_server_dispatch(host, &udp, &ip_packet.src_ip, udp.src_port);
+            }
             return;
         }
 
@@ -312,16 +343,9 @@ static void host_receive(Node* self, Interface* in_interface, const uint8_t* raw
                 host->last_tcp = tcp_seg;
                 host->has_last_tcp = true;
 
-                // Send response if generated (e.g., SYN-ACK, ACK)
                 if (tcp_response.flags != 0 && tcp_response.src_port > 0) {
                     response_len = packet_to_bytes((Packet*)&tcp_response, response_raw, sizeof(response_raw));
                     if (response_len > 0) {
-                        // Recompute checksum
-                        tcp_response.checksum = tcp_compute_checksum(
-                            response_raw, response_len,
-                            &host->ip_address, &ip_packet.src_ip);
-                        response_len = packet_to_bytes((Packet*)&tcp_response, response_raw, sizeof(response_raw));
-
                         if (ipv4_create(&response_ip, host->ip_address, ip_packet.src_ip,
                                         IPV4_DEFAULT_TTL, IPV4_PROTOCOL_TCP,
                                         response_raw, response_len)) {
@@ -332,6 +356,12 @@ static void host_receive(Node* self, Interface* in_interface, const uint8_t* raw
                             }
                         }
                     }
+                }
+
+                if (socket->state == TCP_ESTABLISHED && socket->has_data &&
+                    socket->local_port == HTTP_SERVER_PORT &&
+                    http_server_get_bound_host() == host) {
+                    http_server_dispatch(host, socket);
                 }
             }
             return;
@@ -385,23 +415,27 @@ static void host_receive(Node* self, Interface* in_interface, const uint8_t* raw
             }
 
             if (icmp.type == ICMP_ECHO_REPLY) {
+                host_record_icmp_rtt(host);
                 printf("%s: Reply from ", host->base.NAME);
                 print_ip_address(&ip_packet.src_ip);
-                printf(": bytes=%zu time=0ms TTL=%u\n", icmp.payload_len, ip_packet.ttl);
+                printf(": bytes=%zu time=%.1fms TTL=%u\n",
+                       icmp.payload_len, host->last_icmp_rtt_ms, ip_packet.ttl);
                 return;
             }
 
             if (icmp.type == ICMP_TIME_EXCEEDED) {
+                host_record_icmp_rtt(host);
                 printf("%s: ICMP Time Exceeded from ", host->base.NAME);
                 print_ip_address(&ip_packet.src_ip);
-                printf("\n");
+                printf(" time=%.1fms\n", host->last_icmp_rtt_ms);
                 return;
             }
 
             if (icmp.type == ICMP_DEST_UNREACHABLE) {
+                host_record_icmp_rtt(host);
                 printf("%s: ICMP Destination Unreachable from ", host->base.NAME);
                 print_ip_address(&ip_packet.src_ip);
-                printf("\n");
+                printf(" time=%.1fms\n", host->last_icmp_rtt_ms);
                 return;
             }
 
@@ -437,6 +471,8 @@ void host_init_with_macs(Host* host, int num_interfaces, const MacAddress* mac_a
     host->has_last_icmp = false;
     host->last_icmp_type = 0;
     host->last_icmp_sequence = 0;
+    host->icmp_in_flight = false;
+    host->last_icmp_rtt_ms = 0.0;
     host->has_last_udp = false;
     host->has_last_tcp = false;
     host->tcp_data_ready = false;
@@ -551,7 +587,23 @@ int host_send_l3_packet(Host* host, const IpAddress* target_ip, uint16_t etherty
     const IpAddress* next_hop_ip;
     const MacAddress* next_hop_mac;
 
-    if (host == NULL || target_ip == NULL || payload == NULL || payload_len > ETHERNET_MAX_PAYLOAD || !host->has_ip) {
+    if (host == NULL || target_ip == NULL || payload == NULL || payload_len > ETHERNET_MAX_PAYLOAD) {
+        return 0;
+    }
+
+    bool target_is_broadcast = target_ip->octet[0] == 255 &&
+                               target_ip->octet[1] == 255 &&
+                               target_ip->octet[2] == 255 &&
+                               target_ip->octet[3] == 255;
+
+    if (target_is_broadcast) {
+        MacAddress bcast_mac;
+        memset(bcast_mac.bytes, 0xFF, sizeof(bcast_mac.bytes));
+        printf("[%s] Sending broadcast Ethernet frame\n", host->base.NAME);
+        return host_send_ethernet_frame(host, &bcast_mac, ethertype, payload, payload_len);
+    }
+
+    if (!host->has_ip) {
         return 0;
     }
 
@@ -626,7 +678,11 @@ int host_send_icmp_echo_request(Host* host, const IpAddress* target_ip, uint8_t 
     }
 
     host->has_last_icmp = false;
+    host->icmp_in_flight = true;
+    host->last_icmp_rtt_ms = 0.0;
+    clock_gettime(CLOCK_MONOTONIC, &host->icmp_send_time);
     if (!icmp_create(&icmp, ICMP_ECHO_REQUEST, 0, 0x1234, sequence, payload, sizeof(payload))) {
+        host->icmp_in_flight = false;
         return 0;
     }
 

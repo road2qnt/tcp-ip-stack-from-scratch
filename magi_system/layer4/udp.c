@@ -152,7 +152,7 @@ size_t udp_to_bytes(const UDPDatagram* datagram, uint8_t* out, size_t out_size)
     write_u16_be(out + 0, datagram->src_port);
     write_u16_be(out + 2, datagram->dst_port);
     write_u16_be(out + 4, datagram->length);
-    write_u16_be(out + 6, 0); // checksum placeholder
+    write_u16_be(out + 6, datagram->checksum);
 
     if (datagram->payload_len > 0) {
         memcpy(out + UDP_HEADER_SIZE, datagram->payload, datagram->payload_len);

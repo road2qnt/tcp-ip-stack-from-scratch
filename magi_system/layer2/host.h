@@ -8,6 +8,8 @@
 #include "arp.h"
 #include "ethernet.h"
 
+#include <time.h>
+
 #define HOST_PENDING_QUEUE_MAX_ENTRIES 64
 
 typedef struct HostPendingPacket {
@@ -34,6 +36,9 @@ typedef struct Host{
     IpAddress last_icmp_source;
     uint16_t last_icmp_sequence;
     bool has_last_icmp;
+    struct timespec icmp_send_time;
+    bool icmp_in_flight;
+    double last_icmp_rtt_ms;
     // Tambahan untuk Host (ARP Table: IP -> MAC)
     ArpTable arp_table;
     HostPendingQueue pending_queue;
