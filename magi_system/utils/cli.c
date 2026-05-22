@@ -60,42 +60,6 @@ static void print_help(void)
 #define RIP_NO_IP         3
 #define RIP_SWITCH_NO_IP  4
 
-static int resolve_ip_target(const char* token, IpAddress* out_ip)
-{
-    int idx;
-
-    if (token == NULL || out_ip == NULL) {
-        return 0;
-    }
-
-    if (ip_parse(token, out_ip)) {
-        return 1;
-    }
-
-    idx = simulator_find_node(&simulator, token);
-    if (idx < 0) {
-        return 0;
-    }
-
-    if (simulator.nodes[idx].type == SIM_NODE_HOST) {
-        Host* host = (Host*)simulator.nodes[idx].node;
-        if (host->has_ip) {
-            *out_ip = host->ip_address;
-            return 1;
-        }
-    } else if (simulator.nodes[idx].type == SIM_NODE_ROUTER) {
-        Router* router = (Router*)simulator.nodes[idx].node;
-        for (int i = 0; i < router->base.NUM_INTERFACES; i++) {
-            if (router->interface_ips[i].has_ip) {
-                *out_ip = router->interface_ips[i].ip_address;
-                return 1;
-            }
-        }
-    }
-
-    return 0;
-}
-
 static int resolve_ip_target_diag(const char* token, IpAddress* out_ip, int* err)
 {
     if (err) *err = RIP_OK;
