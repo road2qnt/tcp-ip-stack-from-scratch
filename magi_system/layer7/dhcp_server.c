@@ -193,9 +193,9 @@ int dhcp_server_handle_discover(const DHCPMessage* discover, DHCPMessage* offer)
     dhcp_add_option(offer, DHCP_OPTION_LEASE_TIME, lease_time, 4);
     dhcp_finish_options(offer);
 
-    printf("[DHCP] Offering IP ");
-    ip_to_string(&offered_ip, (char[32]){0}, 32, false);
-    printf(" to client\n");
+    char offer_ip_buf[20];
+    ip_to_string(&offered_ip, offer_ip_buf, sizeof(offer_ip_buf), false);
+    printf("[DHCP] Offering IP %s to client\n", offer_ip_buf);
 
     return 1;
 }

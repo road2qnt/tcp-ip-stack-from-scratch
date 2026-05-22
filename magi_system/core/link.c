@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 199309L
 
 #include "link.h"
+#include "sim_clock.h"
 #include <time.h>
 
 void link_init(Link* link, Interface* interface1_, Interface* interface2_, float delay_){
@@ -60,13 +61,18 @@ void transmit(Interface* sender, Link* link, const uint8_t* packet, size_t packe
         return;
     }
 
-    if (link->delay>0){
+    if (sim_clock_realtime_enabled() && link->delay > 0) {
+        if (sim_clock_enqueue(sender, receiver, link, packet, packet_len)) {
+            return;
+        }
+    }
+
+    if (link->delay > 0 && !sim_clock_realtime_enabled()){
         struct timespec request;
         request.tv_sec = (time_t)(link->delay / 1000);
         request.tv_nsec = (long)((link->delay - (request.tv_sec * 1000)) * 1000000);
         nanosleep(&request, NULL);
     }
 
-    // Receive 
     receive(receiver, packet, packet_len);
 }

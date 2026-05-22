@@ -20,4 +20,6 @@ void process(CLI*cli)
 void cli();
 bool process(char* command);
 
+Simulator* cli_simulator(void);
+
 #endif

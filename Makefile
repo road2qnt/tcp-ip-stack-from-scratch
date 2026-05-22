@@ -23,6 +23,7 @@ SRCS := \
 	magi_system/core/link.c \
 	magi_system/core/mac.c \
 	magi_system/core/packet.c \
+	magi_system/core/sim_clock.c \
 	magi_system/dataStructure/map.c \
 	magi_system/layer2/host.c \
 	magi_system/layer2/switch.c \

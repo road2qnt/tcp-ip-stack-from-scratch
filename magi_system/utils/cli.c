@@ -159,6 +159,10 @@ static int cli_find_router(const char* name, Router** out_router)
     return 1;
 }
 
+Simulator* cli_simulator(void){
+    return &simulator;
+}
+
 void cli(){
     printf("=== Magi System ===\n");
     bool loop = true;
