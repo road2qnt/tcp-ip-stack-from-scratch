@@ -84,7 +84,7 @@ Perintah yang tersedia:
 | No | NPM | Nama | Kontribusi |
 |----|-----|------|------------|
 | 1 | 13524115 | **Ega Luthfi Rais** | M3 Transport Layer (UDP, TCP, TCP Socket State Machine), M2 Integration (Host, Router, IPv4, ICMP), Debugger Suite, CLI Commands, Middleboxes (NAT, ACL), GUI, Layer 7 stubs (DHCP, DNS, HTTP, MagiSocket, RIP), Build System, Utils (JSON, Loader, Visualizer) |
-| 2 | 13524141 | Ahmad Fauzan Putra | — |
+| 2 | 13524141 | Ahmad Fauzan Putra | bug fixes M1, M2, M4. GUI |
 | 3 | 13524146 | **Leonardus Brain Fatolosja** | M0 Fondasi Simulasi (Interface, Link, MAC, Packet, Data Structures), M1 Data Link Layer (Ethernet, ARP, Switch, Host), M2 Network Layer (IPv4, ICMP, Router), CLI & Visualizer awal, Makefile & Project Structure |
 | 4 | 13524134 | Salman Faiz Assidqi | — |
 | 5 | 13524124 | Zahran Alvan Putra Winarko | — |
