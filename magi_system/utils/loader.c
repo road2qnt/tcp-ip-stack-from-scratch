@@ -125,6 +125,10 @@ int simulator_save(Simulator *simulator, const char *filename)
             ip_address_to_string(&rtr->interface_ips[p].ip_address, ip_str, sizeof(ip_str));
             json_object_add(inf, "ip_address", json_create_string(ip_str));
 
+            if (rtr->interface_vlans[p] > 0) {
+                json_object_add(inf, "vlan_id", json_create_number((double)rtr->interface_vlans[p]));
+            }
+
             json_array_add(intfs_arr, inf);
         }
         json_object_add(r, "interfaces", intfs_arr);
@@ -358,6 +362,11 @@ int simulator_load(Simulator *simulator, const char *filename)
                     if (parse_ip_address(ip_val->data.string, &rtr->interface_ips[port - 1].ip_address)) {
                         rtr->interface_ips[port - 1].has_ip = true;
                         rtr->interface_ips[port - 1].portNumber = port;
+                    }
+
+                    JsonValue *vlan_val = json_object_get(inf, "vlan_id");
+                    if (vlan_val != NULL && vlan_val->type == JSON_NUMBER) {
+                        rtr->interface_vlans[port - 1] = (int)vlan_val->data.number;
                     }
                 }
             }

@@ -25,7 +25,7 @@
     {
       "name": "R1",
       "interfaces": [
-        { "port": 1, "ip_address": "192.168.1.1/24" },
+        { "port": 1, "ip_address": "192.168.1.1/24", "vlan_id": 10 },
         { "port": 2, "ip_address": "10.0.0.1/8" }
       ],
       "routing_table": [

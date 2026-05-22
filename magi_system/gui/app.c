@@ -41,6 +41,20 @@
 #define INPUT_H       30
 #define TOPO_H        (WINDOW_H - LOG_H - INPUT_H)
 
+/* Toolbar (clickable playback controls) */
+#define TOOLBAR_Y     24
+#define TOOLBAR_H     32
+#define TOPO_TOP_Y    (TOOLBAR_Y + TOOLBAR_H + 28)  /* below toolbar + legend */
+
+/* Speed slider domain (log scale): 0.0625x .. 16x, default 1x */
+#define SPEED_LOG_MIN -4.0
+#define SPEED_LOG_MAX  4.0
+
+/* Events panel (lives in lower half of the right panel) */
+#define EVENT_RING_CAP   512
+#define EVENT_SUMMARY_LEN 80
+#define EVENT_ROW_H       28
+
 #define LOG_LINES     400
 #define LOG_LINE_LEN  256
 #define INPUT_BUF_LEN 240
@@ -97,6 +111,49 @@ typedef struct {
     int port1, port2;
 } GLink;
 
+/* Toolbar widgets */
+typedef enum {
+    WIDGET_NONE = 0,
+    WIDGET_BTN_PLAYPAUSE,
+    WIDGET_BTN_STEP,
+    WIDGET_BTN_RESET,
+    WIDGET_SLIDER_SPEED,
+} WidgetId;
+
+typedef struct {
+    SDL_Rect bounds;
+    bool     hovered;
+    bool     pressed;
+} Widget;
+
+/* Event log classifications. Entries are appended whenever a log line
+ * is captured and classified; clicking one in the right-panel events list
+ * flashes the involved node and pauses the sim (replay-style). */
+typedef enum {
+    EV_NONE = 0,
+    EV_ARP_TX,
+    EV_ARP_RX,
+    EV_ICMP_REQ,
+    EV_ICMP_REPLY,
+    EV_FORWARD_L2,
+    EV_FLOOD,
+    EV_DROP,
+    EV_ROUTE,
+    EV_TCP,
+    EV_DHCP,
+    EV_DNS,
+    EV_HTTP,
+    EV_GENERIC,
+} EventKind;
+
+typedef struct {
+    EventKind kind;
+    double    sim_time_ms;
+    int       log_idx;       /* slot index in log_lines ring at time of capture */
+    int       node_idx;      /* primary involved node, or -1 */
+    char      summary[EVENT_SUMMARY_LEN];
+} EventEntry;
+
 typedef struct {
     Simulator* sim;
     SDL_Window* window;
@@ -133,6 +190,27 @@ typedef struct {
     int  pipe_w;
     int  orig_stdout;
     int  orig_stderr;
+
+    /* Toolbar widgets (hit boxes filled in render-time) */
+    Widget   widget_play;
+    Widget   widget_step;
+    Widget   widget_reset;
+    Widget   widget_slider;
+    int      slider_dragging;   /* 1 while user holds the slider handle */
+    WidgetId hover_widget;
+
+    /* Event panel state */
+    EventEntry events[EVENT_RING_CAP];
+    int        events_head;
+    int        events_count;
+    int        selected_event;     /* absolute event id (across rolls), -1 if none */
+    int        first_event_id;     /* absolute id of oldest entry currently in ring */
+    int        events_scroll;      /* lines hidden from top */
+    int        events_hover_row;   /* row hovered in current frame, -1 if none */
+    SDL_Rect   events_panel_rect;  /* updated each render for hit testing */
+
+    int      detail_scroll;        /* lines hidden from top of detail panel */
+    SDL_Rect detail_panel_rect;    /* updated each render for hit testing */
 } AppState;
 
 /* ======================== FONT RENDERING ======================== */
@@ -165,6 +243,28 @@ static int draw_string(SDL_Renderer* r, int x, int y,
         str++;
     }
     return x - ox;
+}
+
+static int count_wrapped_lines(const char* str, int max_width)
+{
+    int lines = 1;
+    int cx = 0;
+    while (*str) {
+        if (*str == '\n') {
+            lines++;
+            cx = 0;
+            str++;
+            continue;
+        }
+        int cw = FONT_W + CHAR_SPACE;
+        if (cx + cw > max_width && cx > 0) {
+            lines++;
+            cx = 0;
+        }
+        cx += cw;
+        str++;
+    }
+    return lines;
 }
 
 static int draw_string_wrapped(SDL_Renderer* r, int x, int y,
@@ -261,6 +361,100 @@ static void fill_circle(SDL_Renderer* r, int cx, int cy, int rad, uint32_t color
     }
 }
 
+/* ======================== TOOLBAR + EVENTS HELPERS ======================== */
+
+static bool point_in_rect(int x, int y, const SDL_Rect* r)
+{
+    return x >= r->x && x < r->x + r->w &&
+           y >= r->y && y < r->y + r->h;
+}
+
+/* Map speed in (0.0625..16) -> ratio in [0,1] on a log2 axis. */
+static double speed_to_ratio(double sp)
+{
+    if (sp <= 0.0) return 0.0;
+    double t = log(sp) / log(2.0);
+    if (t < SPEED_LOG_MIN) t = SPEED_LOG_MIN;
+    if (t > SPEED_LOG_MAX) t = SPEED_LOG_MAX;
+    return (t - SPEED_LOG_MIN) / (SPEED_LOG_MAX - SPEED_LOG_MIN);
+}
+
+static double ratio_to_speed(double r)
+{
+    if (r < 0.0) r = 0.0;
+    if (r > 1.0) r = 1.0;
+    double t = SPEED_LOG_MIN + r * (SPEED_LOG_MAX - SPEED_LOG_MIN);
+    return pow(2.0, t);
+}
+
+/* Snap to a friendly preset speed if very close. */
+static double snap_speed(double sp)
+{
+    static const double presets[] = {
+        0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0
+    };
+    for (size_t i = 0; i < sizeof(presets)/sizeof(presets[0]); i++) {
+        double diff = fabs(presets[i] - sp) / presets[i];
+        if (diff < 0.08) return presets[i];
+    }
+    return sp;
+}
+
+static uint32_t event_color(EventKind k)
+{
+    switch (k) {
+        case EV_ARP_TX:
+        case EV_ARP_RX:      return COL_PKT_ARP;
+        case EV_ICMP_REQ:
+        case EV_ICMP_REPLY:  return COL_PKT_ICMP;
+        case EV_FORWARD_L2:  return 0x88CCFFFFu;
+        case EV_FLOOD:       return 0xFFCC66FFu;
+        case EV_DROP:        return 0xFF6644FFu;
+        case EV_ROUTE:       return COL_ROUTER;
+        case EV_TCP:         return COL_PKT_TCP;
+        case EV_DHCP:        return 0xCC99FFFFu;
+        case EV_DNS:         return 0xFF99CCFFu;
+        case EV_HTTP:        return 0x99FFCCFFu;
+        default:             return COL_TEXT_DIM;
+    }
+}
+
+static const char* event_short_label(EventKind k)
+{
+    switch (k) {
+        case EV_ARP_TX:      return "ARP TX";
+        case EV_ARP_RX:      return "ARP RX";
+        case EV_ICMP_REQ:    return "ICMP>";
+        case EV_ICMP_REPLY:  return "ICMP<";
+        case EV_FORWARD_L2:  return "L2 FWD";
+        case EV_FLOOD:       return "FLOOD";
+        case EV_DROP:        return "DROP";
+        case EV_ROUTE:       return "ROUTE";
+        case EV_TCP:         return "TCP";
+        case EV_DHCP:        return "DHCP";
+        case EV_DNS:         return "DNS";
+        case EV_HTTP:        return "HTTP";
+        default:             return "INFO";
+    }
+}
+
+static void render_button(SDL_Renderer* r, const Widget* w, const char* label,
+                          uint32_t base, uint32_t hover, uint32_t active)
+{
+    uint32_t fill = base;
+    if (w->pressed)      fill = active;
+    else if (w->hovered) fill = hover;
+
+    fill_rounded_rect(r, w->bounds.x, w->bounds.y, w->bounds.w, w->bounds.h, 4, fill);
+    SDL_SetRenderDrawColor(r, 0xFF, 0xFF, 0xFF, 0x66);
+    SDL_RenderDrawRect(r, &w->bounds);
+
+    int pw = (int)strlen(label) * (FONT_W + CHAR_SPACE);
+    int tx = w->bounds.x + (w->bounds.w - pw) / 2;
+    int ty = w->bounds.y + (w->bounds.h - FONT_H_PX) / 2;
+    draw_string(r, tx, ty, label, 0xFF, 0xFF, 0xFF, 0xFF);
+}
+
 static uint32_t pkt_color_for(uint16_t ethertype, uint8_t l4_protocol)
 {
     if (ethertype == 0x0806) return COL_PKT_ARP;
@@ -286,12 +480,98 @@ static const char* pkt_label_for(uint16_t ethertype, uint8_t l4_protocol)
 
 /* ======================== LOG / INPUT / STDOUT CAPTURE ======================== */
 
+static int find_node_by_name(AppState* s, const char* name)
+{
+    for (size_t i = 0; i < s->sim->node_count; i++) {
+        if (strcmp(s->sim->nodes[i].name, name) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static EventKind classify_event(AppState* s, const char* line,
+                                 int* node_out, char* summary, size_t cap)
+{
+    *node_out = -1;
+    summary[0] = '\0';
+    if (line == NULL || line[0] == '\0') return EV_NONE;
+
+    const char* rest = line;
+    if (line[0] == '[') {
+        const char* end = strchr(line, ']');
+        if (end != NULL && end - line < 32) {
+            char name[32];
+            size_t nlen = (size_t)(end - line - 1);
+            if (nlen >= sizeof(name)) nlen = sizeof(name) - 1;
+            memcpy(name, line + 1, nlen);
+            name[nlen] = '\0';
+            *node_out = find_node_by_name(s, name);
+            rest = end + 1;
+            while (*rest == ' ') rest++;
+        }
+    }
+
+    EventKind kind = EV_GENERIC;
+    if      (strstr(rest, "Sending ARP Request"))                kind = EV_ARP_TX;
+    else if (strstr(rest, "ARP Request received"))               kind = EV_ARP_RX;
+    else if (strstr(rest, "ARP Reply received"))                 kind = EV_ARP_RX;
+    else if (strstr(rest, "ICMP Echo Request"))                  kind = EV_ICMP_REQ;
+    else if (strstr(rest, "ICMP Echo Reply"))                    kind = EV_ICMP_REPLY;
+    else if (strstr(line, "Reply from"))                         kind = EV_ICMP_REPLY;
+    else if (strstr(rest, "Flooding"))                           kind = EV_FLOOD;
+    else if (strstr(rest, "Dropped") || strstr(rest, "drop"))    kind = EV_DROP;
+    else if (strstr(rest, "Forwarding frame"))                   kind = EV_FORWARD_L2;
+    else if (strstr(rest, "Forwarding IPv4") ||
+             strstr(rest, "Routing"))                            kind = EV_ROUTE;
+    else if (strncmp(rest, "[TCP]", 5) == 0 ||
+             strstr(rest, "TCP]") || strstr(rest, "Socket"))     kind = EV_TCP;
+    else if (strstr(rest, "DHCP"))                               kind = EV_DHCP;
+    else if (strstr(rest, "DNS"))                                kind = EV_DNS;
+    else if (strstr(rest, "HTTP"))                               kind = EV_HTTP;
+
+    snprintf(summary, cap, "%s", rest);
+    size_t L = strlen(summary);
+    while (L > 0 && (summary[L-1] == '\n' || summary[L-1] == '\r')) summary[--L] = '\0';
+    return kind;
+}
+
+static void event_push(AppState* s, const char* line, int log_slot)
+{
+    int node_idx = -1;
+    char summary[EVENT_SUMMARY_LEN];
+    EventKind kind = classify_event(s, line, &node_idx, summary, sizeof(summary));
+    if (kind == EV_NONE) return;
+
+    if (kind == EV_GENERIC) {
+        if (line[0] == '=' || strncmp(line, "magi>", 5) == 0 ||
+            strstr(line, "MAGI SYSTEM") != NULL ||
+            strstr(line, "Commands:") != NULL) {
+            return;
+        }
+    }
+
+    int idx = s->events_head;
+    EventEntry* e = &s->events[idx];
+    e->kind = kind;
+    e->sim_time_ms = sim_clock_now_ms();
+    e->log_idx = log_slot;
+    e->node_idx = node_idx;
+    snprintf(e->summary, EVENT_SUMMARY_LEN, "%s", summary);
+
+    s->events_head = (s->events_head + 1) % EVENT_RING_CAP;
+    if (s->events_count < EVENT_RING_CAP) {
+        s->events_count++;
+    } else {
+        s->first_event_id++;
+    }
+}
+
 static void log_append_line(AppState* s, const char* line)
 {
     int idx = s->log_head;
     snprintf(s->log_lines[idx], LOG_LINE_LEN, "%s", line);
     s->log_head = (s->log_head + 1) % LOG_LINES;
     if (s->log_count < LOG_LINES) s->log_count++;
+    event_push(s, line, idx);
 }
 
 static void log_append_chars(AppState* s, const char* buf, ssize_t n)
@@ -573,7 +853,7 @@ static void append(char* buf, size_t bufsz, const char* fmt, ...)
 
 static const char* get_node_detail(AppState* state, int node_idx)
 {
-    static char buf[2048];
+    static char buf[8192];
     buf[0] = '\0';
 
     if (node_idx < 0 || node_idx >= (int)state->sim->node_count) return "";
@@ -585,7 +865,7 @@ static const char* get_node_detail(AppState* state, int node_idx)
     append(buf, sizeof(buf), "Type: %s\n", node_type_label(entry->type));
     append(buf, sizeof(buf), "Interfaces: %d\n", node->NUM_INTERFACES);
 
-    for (int i = 0; i < node->NUM_INTERFACES && i < 6; i++) {
+    for (int i = 0; i < node->NUM_INTERFACES; i++) {
         const Interface* iface = &node->interfaces[i];
         append(buf, sizeof(buf),
                "  Port %d: %02X:%02X:%02X:%02X:%02X:%02X %s\n",
@@ -616,7 +896,7 @@ static const char* get_node_detail(AppState* state, int node_idx)
         case SIM_NODE_SWITCH: {
             const Switch* sw = (const Switch*)node;
             append(buf, sizeof(buf), "MAC table: %zu entries\n", sw->mac_table.size);
-            for (int i = 0; i < sw->base.NUM_INTERFACES && i < 8; i++) {
+            for (int i = 0; i < sw->base.NUM_INTERFACES; i++) {
                 if (sw->port_configs[i].mode == SWITCH_PORT_TRUNK ||
                     sw->port_configs[i].vlan_id != SWITCH_DEFAULT_VLAN_ID) {
                     append(buf, sizeof(buf),
@@ -632,7 +912,7 @@ static const char* get_node_detail(AppState* state, int node_idx)
             const Router* rt = (const Router*)node;
             append(buf, sizeof(buf), "Routes: %zu\n", rt->route_count);
             append(buf, sizeof(buf), "ARP table: %zu entries\n", rt->arp_table.size);
-            for (size_t i = 0; i < rt->route_count && i < 5; i++) {
+            for (size_t i = 0; i < rt->route_count; i++) {
                 const RoutingTableEntry* rte = &rt->routing_table[i];
                 append(buf, sizeof(buf),
                        "  %d.%d.%d.%d/%d -> %d.%d.%d.%d (if%d)\n",
@@ -656,21 +936,11 @@ static void render(AppState* state)
 {
     SDL_Renderer* r = state->renderer;
 
-    /* Clear */
     set_col(r, COL_BG);
     SDL_RenderClear(r);
 
-    /* Title */
-    draw_string(r, 12, 8, "MAGI SYSTEM - Topology Visualizer",
+    draw_string(r, 12, 6, "MAGI SYSTEM - Topology Visualizer",
                 COL_R(COL_TITLE), COL_G(COL_TITLE), COL_B(COL_TITLE), COL_A(COL_TITLE));
-
-    char header[64];
-    snprintf(header, sizeof(header),
-             "Nodes: %zu | Links: %zu | [R]efresh [ESC] Quit",
-             state->sim->node_count, state->sim->link_count);
-    draw_string(r, 12, 24, header,
-                COL_R(COL_TEXT_DIM), COL_G(COL_TEXT_DIM),
-                COL_B(COL_TEXT_DIM), COL_A(COL_TEXT_DIM));
 
     if (state->sim->node_count == 0) {
         draw_string(r, (WINDOW_W - PANEL_W) / 2 - 140, WINDOW_H / 2,
@@ -767,10 +1037,94 @@ static void render(AppState* state)
                     COL_R(pc), COL_G(pc), COL_B(pc), 0xFF);
     }
 
+    /* ---- Toolbar: Play/Pause, Step, Reset, Speed slider ---- */
+    {
+        bool ps = sim_clock_is_paused();
+        double sp = sim_clock_get_speed();
+        int tx = LEGEND_X;
+        int ty = TOOLBAR_Y;
+        int th = TOOLBAR_H;
+
+        SDL_Rect strip = { 0, ty - 4, WINDOW_W - PANEL_W, th + 8 };
+        set_col(r, 0x101A2EFFu);
+        SDL_RenderFillRect(r, &strip);
+        set_col(r, 0x223355FFu);
+        SDL_RenderDrawLine(r, 0, ty + th + 4, WINDOW_W - PANEL_W, ty + th + 4);
+
+        state->widget_play.bounds = (SDL_Rect){ tx, ty, 96, th };
+        render_button(r, &state->widget_play,
+                      ps ? "PLAY >" : "PAUSE ||",
+                      ps ? 0x115533FFu : 0x553311FFu,
+                      ps ? 0x227755FFu : 0x885533FFu,
+                      ps ? 0x33AA77FFu : 0xAA6644FFu);
+        tx += 104;
+
+        state->widget_step.bounds = (SDL_Rect){ tx, ty, 76, th };
+        render_button(r, &state->widget_step, "STEP >|",
+                      0x223355FFu, 0x335577FFu, 0x4477AAFFu);
+        tx += 84;
+
+        state->widget_reset.bounds = (SDL_Rect){ tx, ty, 72, th };
+        render_button(r, &state->widget_reset, "RESET",
+                      0x332244FFu, 0x553366FFu, 0x774488FFu);
+        tx += 80;
+
+        int slider_x = tx + 60;
+        int slider_w = 200;
+        int slider_y = ty + th / 2 - 2;
+        int slider_h = 4;
+        state->widget_slider.bounds = (SDL_Rect){
+            slider_x - 8, ty + 6, slider_w + 16, th - 12
+        };
+
+        draw_string(r, tx, ty + (th - FONT_H_PX) / 2, "Speed:",
+                    0xCC, 0xDD, 0xEE, 0xFF);
+
+        SDL_Rect track = { slider_x, slider_y, slider_w, slider_h };
+        set_col(r, 0x223355FFu);
+        SDL_RenderFillRect(r, &track);
+        set_col(r, 0x556699FFu);
+        SDL_RenderDrawRect(r, &track);
+
+        for (double mark = -2.0; mark <= 2.0; mark += 2.0) {
+            double rt = (mark - SPEED_LOG_MIN) / (SPEED_LOG_MAX - SPEED_LOG_MIN);
+            int mx = slider_x + (int)(rt * slider_w);
+            set_col(r, 0x6688AAFFu);
+            SDL_RenderDrawLine(r, mx, slider_y - 4, mx, slider_y + slider_h + 4);
+        }
+
+        double r_now = speed_to_ratio(sp);
+        int hx = slider_x + (int)(r_now * slider_w);
+        SDL_Rect handle = { hx - 5, ty + 4, 10, th - 8 };
+        uint32_t hcol = state->slider_dragging ? 0xFFDD66FFu :
+                       (state->hover_widget == WIDGET_SLIDER_SPEED ? 0xCCAA44FFu : 0x99AA55FFu);
+        fill_rounded_rect(r, handle.x, handle.y, handle.w, handle.h, 2, hcol);
+        set_col(r, 0xFFFFFFAAu);
+        SDL_RenderDrawRect(r, &handle);
+
+        char sps[24];
+        if (sp >= 1.0) snprintf(sps, sizeof(sps), "%.0fx", sp);
+        else           snprintf(sps, sizeof(sps), "%.3gx", sp);
+        draw_string(r, slider_x + slider_w + 12, ty + (th - FONT_H_PX) / 2,
+                    sps, 0xFF, 0xEE, 0x99, 0xFF);
+
+        const char* badge = ps ? "[ PAUSED ]" : "[ LIVE ]";
+        int bw = (int)strlen(badge) * (FONT_W + CHAR_SPACE);
+        int bx = WINDOW_W - PANEL_W - bw - 12;
+        int by = ty + (th - FONT_H_PX) / 2;
+        SDL_Rect bbg = { bx - 6, by - 3, bw + 12, FONT_H_PX + 6 };
+        set_col(r, ps ? 0x553322F0u : 0x114433E0u);
+        SDL_RenderFillRect(r, &bbg);
+        set_col(r, ps ? 0xFFAA66FFu : 0x66FFAAFFu);
+        SDL_RenderDrawRect(r, &bbg);
+        draw_string(r, bx, by, badge,
+                    ps ? 0xFF : 0x66, ps ? 0xAA : 0xFF, ps ? 0x66 : 0xAA, 0xFF);
+    }
+
     /* ---- Legend (compact horizontal strip) ---- */
     {
         int lx = LEGEND_X;
-        int ly = 44;
+        int ly = TOOLBAR_Y + TOOLBAR_H + 10;
         int lw = 540;
         int lh = 18;
 
@@ -810,8 +1164,8 @@ static void render(AppState* state)
         draw_string(r, x + 14, ly + 3, "UDP", 0xFF, 0xFF, 0xCC, 0xFF);
     }
 
-    /* ---- Detail Panel ---- */
-    if (state->selected_idx >= 0) {
+    /* ---- Right Panel: detail (top) + events list (bottom) ---- */
+    {
         int px = WINDOW_W - PANEL_W;
         int pw = PANEL_W;
         int ph = WINDOW_H;
@@ -819,26 +1173,178 @@ static void render(AppState* state)
         SDL_Rect panel_bg = {px, 0, pw, ph};
         set_col(r, COL_PANEL);
         SDL_RenderFillRect(r, &panel_bg);
-
         set_col(r, 0x335577FFu);
         SDL_RenderDrawLine(r, px, 0, px, ph);
 
-        const SimulatorNodeEntry* entry = &state->sim->nodes[state->selected_idx];
-        char ptitle[64];
-        snprintf(ptitle, sizeof(ptitle), " %s [%s]", entry->name,
-                 node_type_label(entry->type));
-        draw_string(r, px + 8, 8, ptitle,
-                    COL_R(COL_TITLE), COL_G(COL_TITLE),
-                    COL_B(COL_TITLE), COL_A(COL_TITLE));
+        int detail_y = 8;
+        int detail_h = 264;
 
+        if (state->selected_idx >= 0) {
+            const SimulatorNodeEntry* entry = &state->sim->nodes[state->selected_idx];
+            char ptitle[64];
+            snprintf(ptitle, sizeof(ptitle), " %s [%s]", entry->name,
+                     node_type_label(entry->type));
+            draw_string(r, px + 8, detail_y, ptitle,
+                        COL_R(COL_TITLE), COL_G(COL_TITLE),
+                        COL_B(COL_TITLE), COL_A(COL_TITLE));
+            set_col(r, 0x446688FFu);
+            SDL_RenderDrawLine(r, px + 8, detail_y + FONT_H_PX + 4,
+                               px + pw - 8, detail_y + FONT_H_PX + 4);
+
+            const char* detail = get_node_detail(state, state->selected_idx);
+            int line_h = FONT_H_PX + LINE_SPACE;
+            int content_y0 = detail_y + FONT_H_PX + 12;
+            int content_h  = detail_h - (FONT_H_PX + 12);
+
+            int total_lines = count_wrapped_lines(detail, pw - 20);
+            int rows_visible = content_h / line_h;
+            if (rows_visible < 1) rows_visible = 1;
+            int max_scroll = total_lines - rows_visible;
+            if (max_scroll < 0) max_scroll = 0;
+            if (state->detail_scroll > max_scroll) state->detail_scroll = max_scroll;
+            if (state->detail_scroll < 0) state->detail_scroll = 0;
+
+            SDL_Rect content_rect = { px + 6, content_y0, pw - 12, content_h };
+            state->detail_panel_rect = content_rect;
+            SDL_RenderSetClipRect(r, &content_rect);
+            draw_string_wrapped(r, px + 8,
+                                content_y0 - state->detail_scroll * line_h,
+                                detail, pw - 20,
+                                0xCC, 0xDD, 0xEE, 0xFF);
+            SDL_RenderSetClipRect(r, NULL);
+
+            if (total_lines > rows_visible) {
+                int bar_x = px + pw - 6;
+                int bar_y = content_y0;
+                int bar_h = rows_visible * line_h;
+                SDL_Rect track = {bar_x, bar_y, 3, bar_h};
+                set_col(r, 0x223344FFu);
+                SDL_RenderFillRect(r, &track);
+
+                double frac_vis = (double)rows_visible / total_lines;
+                double frac_off = (double)state->detail_scroll / total_lines;
+                int handle_y = bar_y + (int)(frac_off * bar_h);
+                int handle_h = (int)(frac_vis * bar_h);
+                if (handle_h < 12) handle_h = 12;
+                set_col(r, 0x778899FFu);
+                SDL_Rect handle = {bar_x, handle_y, 3, handle_h};
+                SDL_RenderFillRect(r, &handle);
+            }
+        } else {
+            state->detail_panel_rect = (SDL_Rect){0, 0, 0, 0};
+            draw_string(r, px + 8, detail_y, " NODE DETAIL",
+                        COL_R(COL_TITLE), COL_G(COL_TITLE),
+                        COL_B(COL_TITLE), COL_A(COL_TITLE));
+            set_col(r, 0x446688FFu);
+            SDL_RenderDrawLine(r, px + 8, detail_y + FONT_H_PX + 4,
+                               px + pw - 8, detail_y + FONT_H_PX + 4);
+            draw_string(r, px + 12, detail_y + FONT_H_PX + 14,
+                        "Click a node to inspect.",
+                        COL_R(COL_TEXT_DIM), COL_G(COL_TEXT_DIM),
+                        COL_B(COL_TEXT_DIM), 0xFF);
+            char counts[64];
+            snprintf(counts, sizeof(counts), "Nodes: %zu   Links: %zu",
+                     state->sim->node_count, state->sim->link_count);
+            draw_string(r, px + 12, detail_y + FONT_H_PX + 36, counts,
+                        0xBB, 0xDD, 0xEE, 0xFF);
+        }
+
+        int ev_y = detail_y + detail_h + 4;
+        int ev_h = ph - ev_y - 4;
+        SDL_Rect ev_bg = {px + 4, ev_y, pw - 8, ev_h};
+        set_col(r, 0x0A1024FFu);
+        SDL_RenderFillRect(r, &ev_bg);
         set_col(r, 0x446688FFu);
-        SDL_RenderDrawLine(r, px + 8, 8 + FONT_H_PX + 4,
-                           px + pw - 8, 8 + FONT_H_PX + 4);
+        SDL_RenderDrawRect(r, &ev_bg);
 
-        const char* detail = get_node_detail(state, state->selected_idx);
-        draw_string_wrapped(r, px + 8, 8 + FONT_H_PX + 12,
-                            detail, pw - 20,
-                            0xCC, 0xDD, 0xEE, 0xFF);
+        int total_seen = state->events_count + state->first_event_id;
+        char hdr[80];
+        snprintf(hdr, sizeof(hdr), " EVENTS  (%d shown / %d total)",
+                 state->events_count, total_seen);
+        draw_string(r, ev_bg.x + 6, ev_bg.y + 4, hdr,
+                    COL_R(COL_TITLE), COL_G(COL_TITLE), COL_B(COL_TITLE), 0xFF);
+        set_col(r, 0x446688FFu);
+        SDL_RenderDrawLine(r, ev_bg.x + 4, ev_bg.y + 18,
+                           ev_bg.x + ev_bg.w - 4, ev_bg.y + 18);
+
+        int list_x = ev_bg.x + 4;
+        int list_y = ev_bg.y + 22;
+        int list_w = ev_bg.w - 14;
+        int list_h = ev_bg.h - 26;
+        int rows_visible = list_h / EVENT_ROW_H;
+        if (rows_visible < 1) rows_visible = 1;
+
+        int max_scroll = state->events_count - rows_visible;
+        if (max_scroll < 0) max_scroll = 0;
+        if (state->events_scroll > max_scroll) state->events_scroll = max_scroll;
+        if (state->events_scroll < 0) state->events_scroll = 0;
+
+        state->events_panel_rect = (SDL_Rect){
+            list_x, list_y, list_w, rows_visible * EVENT_ROW_H
+        };
+
+        int n_to_draw = state->events_count - state->events_scroll;
+        if (n_to_draw > rows_visible) n_to_draw = rows_visible;
+
+        for (int row = 0; row < n_to_draw; row++) {
+            int rev = state->events_scroll + row;
+            int idx = (state->events_head - 1 - rev + EVENT_RING_CAP * 2)
+                      % EVENT_RING_CAP;
+            EventEntry* e = &state->events[idx];
+            int abs_id = state->first_event_id + state->events_count - 1 - rev;
+
+            SDL_Rect rr = {list_x, list_y + row * EVENT_ROW_H,
+                           list_w, EVENT_ROW_H - 2};
+            bool sel = (abs_id == state->selected_event);
+            bool hov = (row == state->events_hover_row);
+            uint32_t rc = sel ? 0x336699FFu :
+                          (hov ? 0x223355FFu : 0x14182CFFu);
+            fill_rounded_rect(r, rr.x, rr.y, rr.w, rr.h, 3, rc);
+
+            uint32_t ecol = event_color(e->kind);
+            fill_circle(r, rr.x + 8, rr.y + 7, 3, ecol);
+
+            char tbuf[16];
+            if (e->sim_time_ms >= 1000.0)
+                snprintf(tbuf, sizeof(tbuf), "%.2fs", e->sim_time_ms / 1000.0);
+            else
+                snprintf(tbuf, sizeof(tbuf), "%.0fms", e->sim_time_ms);
+            draw_string(r, rr.x + 16, rr.y + 2, tbuf, 0xCC, 0xDD, 0xEE, 0xFF);
+
+            draw_string(r, rr.x + 70, rr.y + 2, event_short_label(e->kind),
+                        COL_R(ecol), COL_G(ecol), COL_B(ecol), 0xFF);
+
+            if (e->node_idx >= 0 && (size_t)e->node_idx < state->sim->node_count) {
+                draw_string(r, rr.x + 130, rr.y + 2,
+                            state->sim->nodes[e->node_idx].name,
+                            0xFF, 0xEE, 0x99, 0xFF);
+            }
+
+            int max_chars = (rr.w - 16) / (FONT_W + CHAR_SPACE);
+            char trim[EVENT_SUMMARY_LEN];
+            snprintf(trim, sizeof(trim), "%s", e->summary);
+            if ((int)strlen(trim) > max_chars - 1 && max_chars >= 4)
+                trim[max_chars - 1] = '\0';
+            draw_string(r, rr.x + 8, rr.y + 14, trim, 0xAA, 0xBB, 0xCC, 0xFF);
+        }
+
+        if (state->events_count > rows_visible) {
+            int bar_x = ev_bg.x + ev_bg.w - 8;
+            int bar_y = list_y;
+            int bar_h = rows_visible * EVENT_ROW_H;
+            SDL_Rect track = {bar_x, bar_y, 4, bar_h};
+            set_col(r, 0x223344FFu);
+            SDL_RenderFillRect(r, &track);
+
+            double frac_vis = (double)rows_visible / state->events_count;
+            double frac_off = (double)state->events_scroll / state->events_count;
+            int handle_y = bar_y + (int)(frac_off * bar_h);
+            int handle_h = (int)(frac_vis * bar_h);
+            if (handle_h < 16) handle_h = 16;
+            set_col(r, 0x667788FFu);
+            SDL_Rect handle = {bar_x, handle_y, 4, handle_h};
+            SDL_RenderFillRect(r, &handle);
+        }
     }
 
     /* ---- Log Panel ---- */
@@ -959,6 +1465,53 @@ static void render(AppState* state)
 
 /* ======================== EVENTS ======================== */
 
+static WidgetId widget_at(AppState* s, int mx, int my)
+{
+    if (point_in_rect(mx, my, &s->widget_play.bounds))   return WIDGET_BTN_PLAYPAUSE;
+    if (point_in_rect(mx, my, &s->widget_step.bounds))   return WIDGET_BTN_STEP;
+    if (point_in_rect(mx, my, &s->widget_reset.bounds))  return WIDGET_BTN_RESET;
+    if (point_in_rect(mx, my, &s->widget_slider.bounds)) return WIDGET_SLIDER_SPEED;
+    return WIDGET_NONE;
+}
+
+static void apply_slider_at_x(AppState* s, int mx)
+{
+    int x0 = s->widget_slider.bounds.x + 8;
+    int w  = s->widget_slider.bounds.w - 16;
+    if (w <= 0) return;
+    double r = (double)(mx - x0) / (double)w;
+    if (r < 0.0) r = 0.0;
+    if (r > 1.0) r = 1.0;
+    double sp = ratio_to_speed(r);
+    sp = snap_speed(sp);
+    sim_clock_set_speed(sp);
+}
+
+static int events_row_at(AppState* s, int mx, int my)
+{
+    if (!point_in_rect(mx, my, &s->events_panel_rect)) return -1;
+    int row = (my - s->events_panel_rect.y) / EVENT_ROW_H;
+    if (row < 0) return -1;
+    if (s->events_scroll + row >= s->events_count) return -1;
+    return row;
+}
+
+/* Replay-style click: flash + select the event's node, pause the sim. */
+static void events_activate_row(AppState* s, int row)
+{
+    int rev = s->events_scroll + row;
+    if (rev < 0 || rev >= s->events_count) return;
+    int idx = (s->events_head - 1 - rev + EVENT_RING_CAP * 2) % EVENT_RING_CAP;
+    EventEntry* ev = &s->events[idx];
+    s->selected_event = s->first_event_id + s->events_count - 1 - rev;
+
+    if (ev->node_idx >= 0 && (size_t)ev->node_idx < s->sim->node_count) {
+        s->flash_at_ms[ev->node_idx] = sim_clock_now_ms() + FLASH_MS;
+        s->selected_idx = ev->node_idx;
+    }
+    if (!sim_clock_is_paused()) sim_clock_set_paused(true);
+}
+
 static void handle_events(AppState* state)
 {
     SDL_Event e;
@@ -1007,30 +1560,111 @@ static void handle_events(AppState* state)
                     if (state->log_scroll < 0) state->log_scroll = 0;
                 } else if (k == SDLK_F5) {
                     state->needs_layout = true;
+                } else if (state->input_len == 0 && k == SDLK_SPACE) {
+                    sim_clock_set_paused(!sim_clock_is_paused());
+                } else if (state->input_len == 0 && k == SDLK_s) {
+                    if (!sim_clock_is_paused()) sim_clock_set_paused(true);
+                    sim_clock_step(50.0);
+                } else if (k == SDLK_LEFTBRACKET) {
+                    sim_clock_set_speed(sim_clock_get_speed() * 0.5);
+                } else if (k == SDLK_RIGHTBRACKET) {
+                    sim_clock_set_speed(sim_clock_get_speed() * 2.0);
+                } else if (state->input_len == 0 && k == SDLK_0) {
+                    sim_clock_set_speed(1.0);
                 }
                 break;
             }
-            case SDL_MOUSEMOTION:
-                if (e.motion.y < TOPO_H) {
-                    state->hover_idx = hit_test_node(state, e.motion.x, e.motion.y);
+            case SDL_MOUSEMOTION: {
+                int mx = e.motion.x, my = e.motion.y;
+                if (state->slider_dragging) {
+                    apply_slider_at_x(state, mx);
+                    state->hover_widget = WIDGET_SLIDER_SPEED;
+                    break;
+                }
+                state->hover_widget = widget_at(state, mx, my);
+                state->widget_play.hovered   = (state->hover_widget == WIDGET_BTN_PLAYPAUSE);
+                state->widget_step.hovered   = (state->hover_widget == WIDGET_BTN_STEP);
+                state->widget_reset.hovered  = (state->hover_widget == WIDGET_BTN_RESET);
+                state->widget_slider.hovered = (state->hover_widget == WIDGET_SLIDER_SPEED);
+
+                state->events_hover_row = events_row_at(state, mx, my);
+
+                if (my >= TOPO_TOP_Y && my < TOPO_H && mx < WINDOW_W - PANEL_W &&
+                    state->hover_widget == WIDGET_NONE) {
+                    state->hover_idx = hit_test_node(state, mx, my);
                     for (size_t i = 0; i < state->gnode_count; i++)
                         state->gnodes[i].hovered = ((int)i == state->hover_idx);
                 } else {
                     state->hover_idx = -1;
+                    for (size_t i = 0; i < state->gnode_count; i++)
+                        state->gnodes[i].hovered = false;
                 }
                 break;
-            case SDL_MOUSEBUTTONDOWN:
-                if (e.button.button == SDL_BUTTON_LEFT && e.button.y < TOPO_H) {
-                    state->selected_idx = hit_test_node(state, e.button.x, e.button.y);
+            }
+            case SDL_MOUSEBUTTONDOWN: {
+                int mx = e.button.x, my = e.button.y;
+
+                int erow = events_row_at(state, mx, my);
+                if (erow >= 0 && e.button.button == SDL_BUTTON_LEFT) {
+                    events_activate_row(state, erow);
+                    break;
+                }
+
+                WidgetId wid = widget_at(state, mx, my);
+                if (wid != WIDGET_NONE && e.button.button == SDL_BUTTON_LEFT) {
+                    switch (wid) {
+                        case WIDGET_BTN_PLAYPAUSE:
+                            sim_clock_set_paused(!sim_clock_is_paused());
+                            state->widget_play.pressed = true;
+                            break;
+                        case WIDGET_BTN_STEP:
+                            if (!sim_clock_is_paused()) sim_clock_set_paused(true);
+                            sim_clock_step(50.0);
+                            state->widget_step.pressed = true;
+                            break;
+                        case WIDGET_BTN_RESET:
+                            state->needs_layout = true;
+                            state->widget_reset.pressed = true;
+                            break;
+                        case WIDGET_SLIDER_SPEED:
+                            state->slider_dragging = 1;
+                            apply_slider_at_x(state, mx);
+                            break;
+                        default: break;
+                    }
+                    break;
+                }
+
+                if (e.button.button == SDL_BUTTON_LEFT &&
+                    my >= TOPO_TOP_Y && my < TOPO_H && mx < WINDOW_W - PANEL_W) {
+                    state->selected_idx = hit_test_node(state, mx, my);
                 }
                 break;
-            case SDL_MOUSEWHEEL:
-                if (e.wheel.y > 0) state->log_scroll += 3;
-                else if (e.wheel.y < 0) {
-                    state->log_scroll -= 3;
-                    if (state->log_scroll < 0) state->log_scroll = 0;
+            }
+            case SDL_MOUSEBUTTONUP:
+                if (state->slider_dragging) state->slider_dragging = 0;
+                state->widget_play.pressed  = false;
+                state->widget_step.pressed  = false;
+                state->widget_reset.pressed = false;
+                break;
+            case SDL_MOUSEWHEEL: {
+                int mx, my;
+                SDL_GetMouseState(&mx, &my);
+                if (point_in_rect(mx, my, &state->detail_panel_rect)) {
+                    state->detail_scroll -= e.wheel.y * 2;
+                    if (state->detail_scroll < 0) state->detail_scroll = 0;
+                } else if (point_in_rect(mx, my, &state->events_panel_rect)) {
+                    state->events_scroll -= e.wheel.y * 3;
+                    if (state->events_scroll < 0) state->events_scroll = 0;
+                } else if (my >= TOPO_H) {
+                    if (e.wheel.y > 0) state->log_scroll += 3;
+                    else if (e.wheel.y < 0) {
+                        state->log_scroll -= 3;
+                        if (state->log_scroll < 0) state->log_scroll = 0;
+                    }
                 }
                 break;
+            }
             default: break;
         }
     }
@@ -1049,6 +1683,9 @@ int gui_run(Simulator* simulator)
     state.hover_idx = -1;
     state.running = true;
     state.needs_layout = true;
+    state.selected_event = -1;
+    state.events_hover_row = -1;
+    state.hover_widget = WIDGET_NONE;
 
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         fprintf(stderr, "SDL init failed: %s\n", SDL_GetError());
@@ -1080,10 +1717,14 @@ int gui_run(Simulator* simulator)
     layout_nodes(&state);
 
     sim_clock_set_realtime(true);
+    sim_clock_set_paused(true);
 
     capture_stdout_init(&state);
     log_append_line(&state, "=== Magi System (GUI) ===");
-    log_append_line(&state, "Type a command and press Enter. Esc quits.");
+    log_append_line(&state, "Started PAUSED. PLAY runs sim, STEP >| advances 50ms.");
+    log_append_line(&state, "Toolbar: PAUSE/PLAY | STEP | RESET | speed slider (0.0625x..16x)");
+    log_append_line(&state, "Click an event row on the right to replay (jumps to + flashes the involved node).");
+    log_append_line(&state, "Keys: SPACE=pause/play, S=step, [/]=halve/double speed, 0=1x, F5=relayout.");
     log_append_line(&state, "Try: H1 ping 10.0.0.5  |  topology  |  help");
     capture_stdout_drain(&state);
 
@@ -1131,6 +1772,8 @@ int gui_run(Simulator* simulator)
     SDL_StopTextInput();
     capture_stdout_restore(&state);
 
+    sim_clock_set_paused(false);
+    sim_clock_set_speed(1.0);
     sim_clock_set_realtime(false);
     sim_clock_clear();
 

@@ -1,5 +1,6 @@
 #include "host.h"
 #include "../core/packet.h"
+#include "../core/sim_clock.h"
 #include "../layer3/icmp.h"
 #include "../layer4/udp.h"
 #include "../layer4/tcp.h"
@@ -81,20 +82,10 @@ static void print_mac_address(const MacAddress* mac)
            mac->bytes[3], mac->bytes[4], mac->bytes[5]);
 }
 
-static double timespec_diff_ms(const struct timespec* start, const struct timespec* end)
-{
-    if (start == NULL || end == NULL) return 0.0;
-    double sec = (double)(end->tv_sec - start->tv_sec);
-    double nsec = (double)(end->tv_nsec - start->tv_nsec);
-    return sec * 1000.0 + nsec / 1000000.0;
-}
-
 static void host_record_icmp_rtt(Host* host)
 {
     if (host == NULL || !host->icmp_in_flight) return;
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    host->last_icmp_rtt_ms = timespec_diff_ms(&host->icmp_send_time, &now);
+    host->last_icmp_rtt_ms = sim_clock_now_ms() - host->icmp_send_time_ms;
     host->icmp_in_flight = false;
 }
 
@@ -680,7 +671,7 @@ int host_send_icmp_echo_request(Host* host, const IpAddress* target_ip, uint8_t 
     host->has_last_icmp = false;
     host->icmp_in_flight = true;
     host->last_icmp_rtt_ms = 0.0;
-    clock_gettime(CLOCK_MONOTONIC, &host->icmp_send_time);
+    host->icmp_send_time_ms = sim_clock_now_ms();
     if (!icmp_create(&icmp, ICMP_ECHO_REQUEST, 0, 0x1234, sequence, payload, sizeof(payload))) {
         host->icmp_in_flight = false;
         return 0;

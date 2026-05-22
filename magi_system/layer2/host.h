@@ -36,7 +36,7 @@ typedef struct Host{
     IpAddress last_icmp_source;
     uint16_t last_icmp_sequence;
     bool has_last_icmp;
-    struct timespec icmp_send_time;
+    double icmp_send_time_ms;
     bool icmp_in_flight;
     double last_icmp_rtt_ms;
     // Tambahan untuk Host (ARP Table: IP -> MAC)

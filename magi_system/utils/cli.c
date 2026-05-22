@@ -54,6 +54,12 @@ static void print_help(void)
     printf("  exit | quit\n");
 }
 
+#define RIP_OK            0
+#define RIP_BAD_FORMAT    1
+#define RIP_NOT_FOUND     2
+#define RIP_NO_IP         3
+#define RIP_SWITCH_NO_IP  4
+
 static int resolve_ip_target(const char* token, IpAddress* out_ip)
 {
     int idx;
@@ -88,6 +94,65 @@ static int resolve_ip_target(const char* token, IpAddress* out_ip)
     }
 
     return 0;
+}
+
+static int resolve_ip_target_diag(const char* token, IpAddress* out_ip, int* err)
+{
+    if (err) *err = RIP_OK;
+    if (token == NULL || out_ip == NULL) {
+        if (err) *err = RIP_BAD_FORMAT;
+        return 0;
+    }
+    if (ip_parse(token, out_ip)) return 1;
+
+    int idx = simulator_find_node(&simulator, token);
+    if (idx < 0) {
+        if (err) *err = RIP_NOT_FOUND;
+        return 0;
+    }
+
+    SimulatorNodeType t = simulator.nodes[idx].type;
+    if (t == SIM_NODE_HOST) {
+        Host* host = (Host*)simulator.nodes[idx].node;
+        if (host->has_ip) {
+            *out_ip = host->ip_address;
+            return 1;
+        }
+        if (err) *err = RIP_NO_IP;
+        return 0;
+    }
+    if (t == SIM_NODE_ROUTER) {
+        Router* router = (Router*)simulator.nodes[idx].node;
+        for (int i = 0; i < router->base.NUM_INTERFACES; i++) {
+            if (router->interface_ips[i].has_ip) {
+                *out_ip = router->interface_ips[i].ip_address;
+                return 1;
+            }
+        }
+        if (err) *err = RIP_NO_IP;
+        return 0;
+    }
+    if (err) *err = RIP_SWITCH_NO_IP;
+    return 0;
+}
+
+static void print_resolve_err(const char* token, int err)
+{
+    switch (err) {
+        case RIP_NOT_FOUND:
+            printf("[SIM] target '%s' not found - not an IP and not a node name (case-sensitive)\n", token);
+            break;
+        case RIP_NO_IP:
+            printf("[SIM] node '%s' has no IP configured (configure via topology.json or dhcp_discover)\n",
+                   token);
+            break;
+        case RIP_SWITCH_NO_IP:
+            printf("[SIM] '%s' is a switch and has no IP - use a host or router as target\n", token);
+            break;
+        default:
+            printf("[SIM] invalid target '%s'\n", token);
+            break;
+    }
 }
 
 static int cli_find_host(const char* name, Host** out_host)
@@ -229,11 +294,50 @@ bool process(char* command){
 
         if (count < 3) {
             printf("Usage: link <device[:port]> <device[:port]> [delay_ms]\n");
+            printf("  e.g. link H1 SW1:24 10   (no brackets; use a colon for ports)\n");
             return true;
         }
 
         if (count >= 4) {
             delay = (float)atof(tokens[3]);
+        }
+
+        /* Diagnose common failure modes before calling simulator_link so
+         * the user knows which endpoint / port is the problem. */
+        for (int i = 0; i < 2; i++) {
+            const char* ep = tokens[1 + i];
+            char name[MAX_NAME];
+            int port = 1;
+            const char* colon = strchr(ep, ':');
+            size_t name_len = colon ? (size_t)(colon - ep) : strlen(ep);
+            if (name_len == 0 || name_len >= sizeof(name)) {
+                printf("[SIM] Invalid endpoint '%s'\n", ep);
+                return true;
+            }
+            memcpy(name, ep, name_len);
+            name[name_len] = '\0';
+            if (colon) port = atoi(colon + 1);
+
+            if (strchr(name, '[') || strchr(name, ']')) {
+                printf("[SIM] '%s' has illegal '[' or ']' - syntax is name:port (no brackets)\n", ep);
+                return true;
+            }
+
+            int idx = simulator_find_node(&simulator, name);
+            if (idx < 0) {
+                printf("[SIM] node '%s' not found (names are case-sensitive)\n", name);
+                return true;
+            }
+            Node* nd = simulator.nodes[idx].node;
+            if (port < 1 || port > nd->NUM_INTERFACES) {
+                printf("[SIM] %s has no port %d (valid: 1..%d)\n",
+                       name, port, nd->NUM_INTERFACES);
+                return true;
+            }
+            if (nd->interfaces[port - 1].link != NULL) {
+                printf("[SIM] %s:%d is already linked\n", name, port);
+                return true;
+            }
         }
 
         if (simulator_link(&simulator, tokens[1], tokens[2], delay)) {
@@ -314,8 +418,15 @@ bool process(char* command){
             return true;
         }
 
-        if (!resolve_ip_target(tokens[2], &target_ip)) {
-            printf("Invalid target: %s\n", tokens[2]);
+        if (!host->has_ip) {
+            printf("[SIM] source host '%s' has no IP (configure via topology.json or dhcp_discover)\n",
+                   tokens[0]);
+            return true;
+        }
+
+        int err = 0;
+        if (!resolve_ip_target_diag(tokens[2], &target_ip, &err)) {
+            print_resolve_err(tokens[2], err);
             return true;
         }
 
@@ -336,8 +447,15 @@ bool process(char* command){
             return true;
         }
 
-        if (!resolve_ip_target(tokens[2], &target_ip)) {
-            printf("Invalid target: %s\n", tokens[2]);
+        if (!host->has_ip) {
+            printf("[SIM] source host '%s' has no IP (configure via topology.json or dhcp_discover)\n",
+                   tokens[0]);
+            return true;
+        }
+
+        int err = 0;
+        if (!resolve_ip_target_diag(tokens[2], &target_ip, &err)) {
+            print_resolve_err(tokens[2], err);
             return true;
         }
 
