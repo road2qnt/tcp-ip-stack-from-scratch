@@ -1,4 +1,5 @@
 #include "dns_server.h"
+#include "magi_socket.h"
 #include "../layer2/host.h"
 #include "../core/packet.h"
 #include <stdio.h>
@@ -377,26 +378,20 @@ static int dns_send_response(Host* host,
 {
     if (host == NULL || response == NULL || dst_ip == NULL) return 0;
 
-    UDPDatagram udp;
-    udp_init(&udp);
-    udp_create(&udp, DNS_SERVER_PORT, dst_port, response, response_len);
-
-    uint8_t udp_raw[UDP_HEADER_SIZE + UDP_MAX_PAYLOAD];
-    size_t udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
-    if (udp_len == 0) return 0;
-    udp.checksum = udp_compute_checksum(udp_raw, udp_len, &host->ip_address, dst_ip);
-    udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
-
-    uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
-    IPv4Packet ip_pkt;
-    if (!ipv4_create(&ip_pkt, host->ip_address, *dst_ip,
-                     IPV4_DEFAULT_TTL, IPV4_PROTOCOL_UDP, udp_raw, udp_len)) {
+    int sockfd = magi_socket(AF_INET, SOCK_DGRAM);
+    if (sockfd < 0) return 0;
+    if (magi_socket_attach_host(sockfd, host) < 0) {
+        magi_close(sockfd);
         return 0;
     }
-    size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
-    if (ip_len == 0) return 0;
+    if (magi_bind(sockfd, &host->ip_address, DNS_SERVER_PORT) < 0) {
+        magi_close(sockfd);
+        return 0;
+    }
 
-    return host_send_l3_packet(host, dst_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
+    int r = magi_sendto(sockfd, response, response_len, dst_ip, dst_port);
+    magi_close(sockfd);
+    return r > 0 ? 1 : 0;
 }
 
 int dns_server_dispatch(Host* host, const UDPDatagram* request,
