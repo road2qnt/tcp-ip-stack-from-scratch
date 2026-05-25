@@ -19,6 +19,9 @@ typedef struct TCPSendBuffer {
 typedef struct TCPReceiveBuffer {
     uint8_t data[TCP_SOCKET_BUFFER_SIZE];
     size_t size;
+    uint8_t pending[TCP_SOCKET_BUFFER_SIZE];
+    bool pending_valid[TCP_SOCKET_BUFFER_SIZE];
+    size_t pending_count;
 } TCPReceiveBuffer;
 
 typedef struct TCPSocket {
@@ -60,6 +63,9 @@ void tcp_socket_free(TCPSocket* socket);
 TCPSocket* tcp_socket_find(TCPSocket* sockets, size_t count,
                             const IpAddress* local_ip, uint16_t local_port,
                             const IpAddress* remote_ip, uint16_t remote_port);
+uint16_t tcp_socket_select_source_port(const TCPSocket* sockets, size_t count,
+                                       const IpAddress* remote_ip, uint16_t remote_port,
+                                       uint16_t preferred_port);
 
 // TCP operations
 int tcp_socket_connect(TCPSocket* socket, const IpAddress* local_ip, uint16_t src_port,
