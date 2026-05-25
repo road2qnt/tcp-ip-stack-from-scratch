@@ -50,13 +50,18 @@ typedef struct MagiSocket {
 
 // MagiSocket API
 int magi_socket_init_all(MagiSocket* sockets, size_t count);
+void magi_socket_reset_all(void);
 int magi_socket(int domain, int type);
 int magi_bind(int sockfd, const IpAddress* ip, uint16_t port);
 int magi_listen(int sockfd, int backlog);
 int magi_accept(int sockfd, IpAddress* client_ip, uint16_t* client_port);
 int magi_connect(int sockfd, const IpAddress* ip, uint16_t port);
 int magi_send(int sockfd, const uint8_t* data, size_t len);
+int magi_sendto(int sockfd, const uint8_t* data, size_t len,
+                const IpAddress* dst_ip, uint16_t dst_port);
 int magi_recv(int sockfd, uint8_t* buf, size_t bufsize);
+int magi_recvfrom(int sockfd, uint8_t* buf, size_t bufsize,
+                  IpAddress* src_ip, uint16_t* src_port);
 int magi_close(int sockfd);
 
 // Internal: associate socket with a host
