@@ -2,6 +2,7 @@
 #include "icmp.h"
 
 #include "../core/packet.h"
+#include "../core/sim_clock.h"
 #include "../layer2/ethernet.h"
 
 #include <stdio.h>
@@ -144,7 +145,9 @@ static int router_queue_pending_packet(
     const IpAddress* next_hop_ip,
     int out_interface,
     int vlan_id,
-    const IPv4Packet* packet
+    const IPv4Packet* packet,
+    unsigned int arp_attempts,
+    double arp_last_attempt_ms
 )
 {
     RouterPendingQueue* queue;
@@ -164,6 +167,8 @@ static int router_queue_pending_packet(
     item->out_interface = out_interface;
     item->vlan_id = vlan_id;
     item->packet = *packet;
+    item->arp_attempts = arp_attempts;
+    item->arp_last_attempt_ms = arp_last_attempt_ms;
 
     queue->tail = (queue->tail + 1) % ROUTER_PENDING_QUEUE_MAX_ENTRIES;
     queue->size++;
@@ -199,6 +204,50 @@ static int router_dequeue_pending_for_ip(Router* router, const IpAddress* next_h
     }
 
     return found;
+}
+
+static RouterPendingPacket* router_find_pending_for_ip(Router* router, const IpAddress* next_hop_ip)
+{
+    size_t index;
+
+    if (router == NULL || next_hop_ip == NULL) {
+        return NULL;
+    }
+
+    index = router->pending_queue.head;
+    for (size_t i = 0; i < router->pending_queue.size; i++) {
+        RouterPendingPacket* pending = &router->pending_queue.items[index];
+        if (ip_octets_equal_public(&pending->next_hop_ip, next_hop_ip)) {
+            return pending;
+        }
+        index = (index + 1) % ROUTER_PENDING_QUEUE_MAX_ENTRIES;
+    }
+
+    return NULL;
+}
+
+static void router_set_arp_attempt_for_ip(
+    Router* router,
+    const IpAddress* next_hop_ip,
+    unsigned int arp_attempts,
+    double attempt_ms
+)
+{
+    size_t index;
+
+    if (router == NULL || next_hop_ip == NULL) {
+        return;
+    }
+
+    index = router->pending_queue.head;
+    for (size_t i = 0; i < router->pending_queue.size; i++) {
+        RouterPendingPacket* pending = &router->pending_queue.items[index];
+        if (ip_octets_equal_public(&pending->next_hop_ip, next_hop_ip)) {
+            pending->arp_attempts = arp_attempts;
+            pending->arp_last_attempt_ms = attempt_ms;
+        }
+        index = (index + 1) % ROUTER_PENDING_QUEUE_MAX_ENTRIES;
+    }
 }
 
 static int router_send_arp_request(Router* router, int out_interface, const IpAddress* target_ip, int vlan_id)
@@ -278,9 +327,11 @@ static int router_send_packet_to_next_hop(
 )
 {
     const MacAddress* next_hop_mac;
+    RouterPendingPacket* existing_pending;
     uint8_t raw_ip[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
     size_t raw_ip_len;
     int vlan_id = 0;
+    double now_ms;
 
     if (router == NULL || packet == NULL || next_hop_ip == NULL) {
         return 0;
@@ -318,11 +369,35 @@ static int router_send_packet_to_next_hop(
     print_ip_address(next_hop_ip);
     printf(", queueing packet\n");
 
-    if (!router_queue_pending_packet(router, next_hop_ip, out_interface, vlan_id, packet)) {
+    existing_pending = router_find_pending_for_ip(router, next_hop_ip);
+    now_ms = sim_clock_now_ms();
+    if (!router_queue_pending_packet(
+            router,
+            next_hop_ip,
+            out_interface,
+            vlan_id,
+            packet,
+            existing_pending == NULL ? 1u : existing_pending->arp_attempts,
+            existing_pending == NULL ? now_ms : existing_pending->arp_last_attempt_ms)) {
         return 0;
     }
 
-    return router_send_arp_request(router, out_interface, next_hop_ip, vlan_id);
+    if (existing_pending != NULL) {
+        return 1;
+    }
+
+    if (!router_send_arp_request(router, out_interface, next_hop_ip, vlan_id)) {
+        return 0;
+    }
+
+    if (!sim_clock_realtime_enabled() &&
+        arp_table_get_const(&router->arp_table, next_hop_ip) == NULL) {
+        router_poll_arp(
+            router,
+            now_ms + (ROUTER_ARP_RETRY_INTERVAL_MS * (ROUTER_ARP_MAX_ATTEMPTS + 1u)));
+    }
+
+    return 1;
 }
 
 static int router_flush_pending_packets(Router* router, const IpAddress* resolved_ip)
@@ -393,6 +468,75 @@ static void router_send_icmp_error(Router* router, const IPv4Packet* original, u
     }
 
     router_send_ipv4_packet(router, &response);
+}
+
+static int router_can_send_error_for_packet(const IPv4Packet* packet)
+{
+    ICMPMessage icmp;
+
+    if (packet == NULL || packet->protocol != IPV4_PROTOCOL_ICMP) {
+        return 1;
+    }
+
+    icmp_init(&icmp);
+    if (!packet_from_bytes((Packet*)&icmp, packet->payload, packet->payload_len)) {
+        return 1;
+    }
+
+    return icmp.type != ICMP_DEST_UNREACHABLE && icmp.type != ICMP_TIME_EXCEEDED;
+}
+
+void router_poll_arp(Router* router, double now_ms)
+{
+    RouterPendingPacket* pending;
+    RouterPendingPacket failed;
+    IpAddress next_hop_ip;
+    int out_interface;
+    int vlan_id;
+    unsigned int next_attempt;
+    double attempt_ms;
+
+    if (router == NULL) {
+        return;
+    }
+
+    for (;;) {
+        pending = NULL;
+        size_t index = router->pending_queue.head;
+        for (size_t i = 0; i < router->pending_queue.size; i++) {
+            RouterPendingPacket* candidate = &router->pending_queue.items[index];
+            if (candidate->arp_last_attempt_ms + ROUTER_ARP_RETRY_INTERVAL_MS <= now_ms) {
+                pending = candidate;
+                break;
+            }
+            index = (index + 1) % ROUTER_PENDING_QUEUE_MAX_ENTRIES;
+        }
+
+        if (pending == NULL) {
+            return;
+        }
+
+        next_hop_ip = pending->next_hop_ip;
+        out_interface = pending->out_interface;
+        vlan_id = pending->vlan_id;
+        if (pending->arp_attempts >= ROUTER_ARP_MAX_ATTEMPTS) {
+            printf("[%s] ARP resolution failed for next-hop ", router->base.NAME);
+            print_ip_address(&next_hop_ip);
+            printf(", sending ICMP Destination Unreachable\n");
+
+            while (router_dequeue_pending_for_ip(router, &next_hop_ip, &failed)) {
+                if (router_can_send_error_for_packet(&failed.packet)) {
+                    router_send_icmp_error(router, &failed.packet, ICMP_DEST_UNREACHABLE, 1);
+                }
+            }
+            continue;
+        }
+
+        next_attempt = pending->arp_attempts + 1;
+        attempt_ms = pending->arp_last_attempt_ms + ROUTER_ARP_RETRY_INTERVAL_MS;
+        router_set_arp_attempt_for_ip(router, &next_hop_ip, next_attempt, attempt_ms);
+        router_send_arp_request(router, out_interface, &next_hop_ip, vlan_id);
+    }
 }
 
 static void router_forward_ipv4_packet(Router* router, IPv4Packet* packet)

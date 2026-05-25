@@ -7,6 +7,8 @@
 
 #define ROUTER_MAX_ROUTES 128
 #define ROUTER_PENDING_QUEUE_MAX_ENTRIES 128
+#define ROUTER_ARP_MAX_ATTEMPTS 3
+#define ROUTER_ARP_RETRY_INTERVAL_MS 1000.0
 
 typedef struct RouterInterfaceAddress {
     int portNumber;
@@ -25,6 +27,8 @@ typedef struct RouterPendingPacket {
     int out_interface;
     int vlan_id;
     IPv4Packet packet;
+    unsigned int arp_attempts;
+    double arp_last_attempt_ms;
 } RouterPendingPacket;
 
 typedef struct RouterPendingQueue {
@@ -54,6 +58,7 @@ const RoutingTableEntry* router_lookup_route(const Router* router, const IpAddre
 int router_learn_arp(Router* router, const ARPMessage* message, int vlan_id);
 int router_send_ipv4_packet(Router* router, IPv4Packet* packet);
 int router_send_icmp_echo_request(Router* router, const IpAddress* target_ip, uint8_t ttl, uint16_t sequence);
+void router_poll_arp(Router* router, double now_ms);
 void router_print_routes(const Router* router);
 
 #endif
