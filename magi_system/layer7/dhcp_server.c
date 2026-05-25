@@ -1,4 +1,5 @@
 #include "dhcp_server.h"
+#include "magi_socket.h"
 #include "../layer2/host.h"
 #include "../core/packet.h"
 #include <stdio.h>
@@ -285,7 +286,7 @@ int dhcp_create_discover(DHCPMessage* msg, uint32_t xid, const uint8_t* mac)
     msg->htype = 1;
     msg->hlen = 6;
     msg->xid = xid;
-    memcpy(msg->chaddr, mac, 16);
+    memcpy(msg->chaddr, mac, 6);
     msg->magic_cookie = DHCP_MAGIC_COOKIE;
     msg->options_len = 0;
 
@@ -314,7 +315,7 @@ int dhcp_create_request(DHCPMessage* msg, uint32_t xid, const uint8_t* mac,
     msg->hlen = 6;
     msg->xid = xid;
     msg->ciaddr = *requested_ip;
-    memcpy(msg->chaddr, mac, 16);
+    memcpy(msg->chaddr, mac, 6);
     msg->magic_cookie = DHCP_MAGIC_COOKIE;
     msg->options_len = 0;
 
@@ -423,26 +424,21 @@ static int dhcp_send_response(Host* host, const DHCPMessage* response)
     uint8_t bcast[] = {255, 255, 255, 255};
     IpAddress broadcast_ip = ip_init(bcast, 0);
 
-    UDPDatagram udp;
-    udp_init(&udp);
-    udp_create(&udp, DHCP_SERVER_PORT, DHCP_CLIENT_PORT, dhcp_raw, (size_t)dhcp_len);
-
-    uint8_t udp_raw[UDP_HEADER_SIZE + UDP_MAX_PAYLOAD];
-    size_t udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
-    if (udp_len == 0) return 0;
-    udp.checksum = udp_compute_checksum(udp_raw, udp_len, &host->ip_address, &broadcast_ip);
-    udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
-
-    uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
-    IPv4Packet ip_pkt;
-    if (!ipv4_create(&ip_pkt, host->ip_address, broadcast_ip,
-                     IPV4_DEFAULT_TTL, IPV4_PROTOCOL_UDP, udp_raw, udp_len)) {
+    int sockfd = magi_socket(AF_INET, SOCK_DGRAM);
+    if (sockfd < 0) return 0;
+    if (magi_socket_attach_host(sockfd, host) < 0) {
+        magi_close(sockfd);
         return 0;
     }
-    size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
-    if (ip_len == 0) return 0;
+    if (magi_bind(sockfd, &host->ip_address, DHCP_SERVER_PORT) < 0) {
+        magi_close(sockfd);
+        return 0;
+    }
 
-    return host_send_l3_packet(host, &broadcast_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
+    int r = magi_sendto(sockfd, dhcp_raw, (size_t)dhcp_len,
+                        &broadcast_ip, DHCP_CLIENT_PORT);
+    magi_close(sockfd);
+    return r > 0 ? 1 : 0;
 }
 
 int dhcp_server_dispatch(Host* host, const UDPDatagram* request, const IpAddress* src_ip)
