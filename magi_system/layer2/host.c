@@ -267,6 +267,7 @@ static void host_receive(Node* self, Interface* in_interface, const uint8_t* raw
                    host->base.NAME, udp.src_port, udp.dst_port, udp.payload_len);
             
             host->last_udp = udp;
+            host->last_udp_src_ip = ip_packet.src_ip;
             host->has_last_udp = true;
 
             if (udp.dst_port == DHCP_SERVER_PORT && dhcp_server_get_bound_host() == host) {
@@ -291,6 +292,10 @@ static void host_receive(Node* self, Interface* in_interface, const uint8_t* raw
                 printf("[%s] Dropped invalid TCP segment\n", host->base.NAME);
                 return;
             }
+            if (!tcp_validate_checksum(&tcp_seg, &ip_packet.src_ip, &ip_packet.dst_ip)) {
+                printf("[%s] Dropped TCP segment with invalid checksum\n", host->base.NAME);
+                return;
+            }
 
             printf("[%s] TCP segment received: %u -> %u flags=0x%02x seq=%u\n",
                    host->base.NAME, tcp_seg.src_port, tcp_seg.dst_port,
@@ -309,7 +314,8 @@ static void host_receive(Node* self, Interface* in_interface, const uint8_t* raw
             }
 
             // If listening socket received SYN, allocate child for the new connection
-            if (socket->is_listening && (tcp_seg.flags & TCP_FLAG_SYN)) {
+            if (socket->is_listening && (tcp_seg.flags & TCP_FLAG_SYN) &&
+                !(tcp_seg.flags & (TCP_FLAG_ACK | TCP_FLAG_FIN | TCP_FLAG_RST))) {
                 int child_idx = tcp_socket_alloc(host->tcp_sockets, TCP_MAX_SOCKETS);
                 if (child_idx >= 0) {
                     TCPSocket* child = &host->tcp_sockets[child_idx];
@@ -352,7 +358,7 @@ static void host_receive(Node* self, Interface* in_interface, const uint8_t* raw
                 if (socket->state == TCP_ESTABLISHED && socket->has_data &&
                     socket->local_port == HTTP_SERVER_PORT &&
                     http_server_get_bound_host() == host) {
-                    http_server_dispatch(host, socket);
+                    http_server_dispatch(host);
                 }
             }
             return;
@@ -467,6 +473,7 @@ void host_init_with_macs(Host* host, int num_interfaces, const MacAddress* mac_a
     host->has_last_udp = false;
     host->has_last_tcp = false;
     host->tcp_data_ready = false;
+    host->next_tcp_source_port = 0;
     arp_table_init(&host->arp_table);
     host_pending_queue_init(&host->pending_queue);
     tcp_socket_init(host->tcp_sockets, TCP_MAX_SOCKETS);
@@ -692,4 +699,25 @@ int host_send_icmp_echo_request(Host* host, const IpAddress* target_ip, uint8_t 
     }
 
     return host_send_l3_packet(host, target_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
+}
+
+uint16_t host_select_tcp_source_port(Host* host, const IpAddress* remote_ip,
+                                     uint16_t remote_port, uint16_t initial_preferred)
+{
+    uint16_t candidate;
+
+    if (host == NULL || remote_ip == NULL) return 0;
+
+    candidate = host->next_tcp_source_port != 0
+                ? host->next_tcp_source_port
+                : initial_preferred;
+    candidate = tcp_socket_select_source_port(host->tcp_sockets, TCP_MAX_SOCKETS,
+                                              remote_ip, remote_port, candidate);
+    if (candidate != 0) {
+        host->next_tcp_source_port = candidate == 65535
+                                     ? 1024
+                                     : (uint16_t)(candidate + 1);
+    }
+
+    return candidate;
 }

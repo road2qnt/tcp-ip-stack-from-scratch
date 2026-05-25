@@ -46,10 +46,12 @@ typedef struct Host{
     // Transport Layer (Milestone 3)
     TCPSocket tcp_sockets[TCP_MAX_SOCKETS];
     UDPDatagram last_udp;
+    IpAddress last_udp_src_ip;
     bool has_last_udp;
     TCPSegment last_tcp;
     bool has_last_tcp;
     bool tcp_data_ready;
+    uint16_t next_tcp_source_port;
 
     // Application Layer (Milestone 4) - MagiSocket fd
     int magi_sock_fd;
@@ -67,5 +69,7 @@ int host_learn_arp(Host* host, const ARPMessage* message);
 int host_send_l3_packet(Host* host, const IpAddress* target_ip, uint16_t ethertype, const uint8_t* payload, size_t payload_len);
 int host_flush_pending_packets(Host* host, const IpAddress* resolved_ip);
 int host_send_icmp_echo_request(Host* host, const IpAddress* target_ip, uint8_t ttl, uint16_t sequence);
+uint16_t host_select_tcp_source_port(Host* host, const IpAddress* remote_ip,
+                                     uint16_t remote_port, uint16_t initial_preferred);
 
 #endif
