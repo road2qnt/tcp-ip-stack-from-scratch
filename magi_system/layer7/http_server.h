@@ -5,7 +5,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "../layer3/ipv4.h"
-#include "../layer4/tcp_socket.h"
 
 #define HTTP_SERVER_PORT 80
 #define HTTP_BUFFER_SIZE 4096
@@ -53,6 +52,6 @@ int http_serve_default(const char* path, char* response, size_t* resp_len, size_
 
 int http_server_attach_host(Host* host);
 Host* http_server_get_bound_host(void);
-int http_server_dispatch(Host* host, TCPSocket* socket);
+int http_server_dispatch(Host* host);
 
 #endif

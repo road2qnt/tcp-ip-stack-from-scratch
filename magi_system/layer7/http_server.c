@@ -1,8 +1,6 @@
 #include "http_server.h"
 #include "magi_socket.h"
 #include "../layer2/host.h"
-#include "../layer4/tcp.h"
-#include "../core/packet.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -234,84 +232,45 @@ Host* http_server_get_bound_host(void)
     return g_server.bound_host;
 }
 
-static int http_server_send_tcp(Host* host, TCPSocket* sock, uint8_t flags,
-                                 const uint8_t* payload, size_t payload_len)
-{
-    if (host == NULL || sock == NULL) return 0;
-
-    TCPSegment seg;
-    uint8_t tcp_raw[TCP_HEADER_SIZE + TCP_MAX_PAYLOAD];
-    size_t tcp_len;
-    IPv4Packet ip_pkt;
-    uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
-    size_t ip_len;
-
-    tcp_init(&seg);
-    seg.src_port = sock->local_port;
-    seg.dst_port = sock->remote_port;
-    seg.seq_num = sock->send_seq;
-    seg.ack_num = sock->recv_seq;
-    seg.flags = flags;
-    seg.window = TCP_WINDOW_SIZE;
-    if (payload != NULL && payload_len > 0) {
-        size_t cap = payload_len < TCP_MAX_PAYLOAD ? payload_len : TCP_MAX_PAYLOAD;
-        memcpy(seg.payload, payload, cap);
-        seg.payload_len = cap;
-    }
-
-    tcp_len = packet_to_bytes((Packet*)&seg, tcp_raw, sizeof(tcp_raw));
-    if (tcp_len == 0) return 0;
-    seg.checksum = tcp_compute_checksum(tcp_raw, tcp_len, &sock->local_ip, &sock->remote_ip);
-    tcp_len = packet_to_bytes((Packet*)&seg, tcp_raw, sizeof(tcp_raw));
-
-    if (!ipv4_create(&ip_pkt, sock->local_ip, sock->remote_ip,
-                     IPV4_DEFAULT_TTL, IPV4_PROTOCOL_TCP, tcp_raw, tcp_len)) {
-        return 0;
-    }
-    ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
-    if (ip_len == 0) return 0;
-
-    if (!host_send_l3_packet(host, &sock->remote_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len)) {
-        return 0;
-    }
-
-    sock->send_seq += seg.payload_len;
-    if (flags & TCP_FLAG_FIN) sock->send_seq += 1;
-    return 1;
-}
-
-int http_server_dispatch(Host* host, TCPSocket* socket)
+int http_server_dispatch(Host* host)
 {
     if (!g_server.running || g_server.bound_host == NULL) return 0;
-    if (host == NULL || socket == NULL) return 0;
-    if (host != g_server.bound_host) return 0;
-    if (socket->local_port != HTTP_SERVER_PORT) return 0;
-    if (socket->state != TCP_ESTABLISHED) return 0;
-    if (!socket->has_data || socket->last_payload_len == 0) return 0;
+    if (host == NULL || host != g_server.bound_host) return 0;
+    if (g_server.listen_sockfd < 0) return 0;
+
+    IpAddress client_ip;
+    uint16_t client_port;
+    int conn_fd = magi_accept(g_server.listen_sockfd, &client_ip, &client_port);
+    if (conn_fd < 0) return 0;
 
     char request_buf[HTTP_BUFFER_SIZE];
-    size_t req_len = socket->last_payload_len < sizeof(request_buf) - 1
-                     ? socket->last_payload_len
-                     : sizeof(request_buf) - 1;
-    memcpy(request_buf, socket->last_payload, req_len);
+    int received = magi_recv(conn_fd, (uint8_t*)request_buf, sizeof(request_buf) - 1);
+    if (received <= 0) {
+        magi_close(conn_fd);
+        return 0;
+    }
+    size_t req_len = (size_t)received;
     request_buf[req_len] = '\0';
-
-    socket->has_data = false;
-    socket->last_payload_len = 0;
 
     char response[HTTP_BUFFER_SIZE];
     size_t resp_len = 0;
     if (!http_server_handle_request(request_buf, req_len, response, &resp_len, sizeof(response))) {
+        magi_close(conn_fd);
         return 0;
     }
 
-    if (!http_server_send_tcp(host, socket, TCP_FLAG_ACK | TCP_FLAG_PSH,
-                               (const uint8_t*)response, resp_len)) {
-        return 0;
+    size_t sent = 0;
+    while (sent < resp_len) {
+        size_t chunk_len = resp_len - sent;
+        if (chunk_len > TCP_MAX_PAYLOAD) chunk_len = TCP_MAX_PAYLOAD;
+        int s = magi_send(conn_fd, (const uint8_t*)response + sent, chunk_len);
+        if (s < 0) {
+            magi_close(conn_fd);
+            return 0;
+        }
+        sent += (size_t)s;
     }
 
-    http_server_send_tcp(host, socket, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
-    socket->state = TCP_FIN_WAIT_1;
-
+    magi_close(conn_fd);
     return 1;
 }
