@@ -140,33 +140,77 @@ static int cli_find_host(const char* name, Host** out_host)
 
 static int dhcp_client_send_broadcast(Host* host, const uint8_t* dhcp_raw, size_t dhcp_len)
 {
-    IpAddress broadcast_ip;
     uint8_t bcast[] = {255, 255, 255, 255};
-    broadcast_ip = ip_init(bcast, 0);
+    IpAddress broadcast_ip = ip_init(bcast, 0);
 
-    UDPDatagram udp;
-    udp_init(&udp);
-    udp_create(&udp, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, dhcp_raw, dhcp_len);
+    // Use 0.0.0.0 as source if no IP yet (correct per RFC 2131)
+    IpAddress src_ip;
+    if (host->has_ip) {
+        src_ip = host->ip_address;
+    } else {
+        uint8_t zeros[] = {0, 0, 0, 0};
+        src_ip = ip_init(zeros, 0);
+    }
 
-    uint8_t udp_raw[UDP_HEADER_SIZE + UDP_MAX_PAYLOAD];
-    size_t udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
-    if (udp_len == 0) return 0;
-
-    IpAddress src_ip = host->has_ip ? host->ip_address : broadcast_ip;
-    udp.checksum = udp_compute_checksum(udp_raw, udp_len, &src_ip, &broadcast_ip);
-    udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
-
-    uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
-    IPv4Packet ip_pkt;
-    if (!ipv4_create(&ip_pkt, src_ip, broadcast_ip,
-                     IPV4_DEFAULT_TTL, IPV4_PROTOCOL_UDP, udp_raw, udp_len)) {
+    int sockfd = magi_socket(AF_INET, SOCK_DGRAM);
+    if (sockfd < 0) return 0;
+    if (magi_socket_attach_host(sockfd, host) < 0) {
+        magi_close(sockfd);
         return 0;
     }
-    size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
-    if (ip_len == 0) return 0;
+    if (magi_bind(sockfd, &src_ip, DHCP_CLIENT_PORT) < 0) {
+        magi_close(sockfd);
+        return 0;
+    }
 
     host->has_last_udp = false;
-    return host_send_l3_packet(host, &broadcast_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
+    int r = magi_sendto(sockfd, dhcp_raw, dhcp_len, &broadcast_ip, DHCP_SERVER_PORT);
+    magi_close(sockfd);
+    return r > 0 ? 1 : 0;
+}
+
+// Send a DNS query from 'requester' to 'server_ip' and parse the response.
+// Returns 1 and fills out_ip on success; 0 on failure.
+static int cli_dns_query(Host* requester, const char* hostname,
+                          const IpAddress* server_ip, IpAddress* out_ip)
+{
+    if (requester == NULL || hostname == NULL || server_ip == NULL || out_ip == NULL) return 0;
+    if (!requester->has_ip) return 0;
+
+    uint8_t query_raw[512];
+    size_t query_len = 0;
+    uint16_t query_id = (uint16_t)((rand() % 0xFFFF) + 1);
+    if (!dns_create_query(query_raw, sizeof(query_raw), &query_len, query_id, hostname)) {
+        return 0;
+    }
+
+    int sockfd = magi_socket(AF_INET, SOCK_DGRAM);
+    if (sockfd < 0) return 0;
+    if (magi_socket_attach_host(sockfd, requester) < 0) {
+        magi_close(sockfd);
+        return 0;
+    }
+    if (magi_bind(sockfd, &requester->ip_address, 5353) < 0) {
+        magi_close(sockfd);
+        return 0;
+    }
+
+    requester->has_last_udp = false;
+    int s = magi_sendto(sockfd, query_raw, query_len, server_ip, DNS_SERVER_PORT);
+    if (s <= 0) {
+        magi_close(sockfd);
+        return 0;
+    }
+
+    // Simulator is synchronous: DNS response arrives before magi_sendto() returns.
+    uint8_t response[512];
+    IpAddress src_ip;
+    uint16_t src_port;
+    int r = magi_recvfrom(sockfd, response, sizeof(response), &src_ip, &src_port);
+    magi_close(sockfd);
+
+    if (r <= 0) return 0;
+    return dns_parse_response(response, (size_t)r, out_ip);
 }
 
 static int cli_find_router(const char* name, Router** out_router)
@@ -534,7 +578,18 @@ bool process(char* command){
         }
 
         TCPSocket* sock = &host->tcp_sockets[sock_idx];
-        tcp_socket_connect(sock, &host->ip_address, (uint16_t)dst_port + 1000,
+        uint32_t preferred_port = (uint32_t)dst_port + 1000u;
+        if (preferred_port > 65535u) preferred_port = 49152u;
+        uint16_t source_port = host_select_tcp_source_port(
+            host, &target_ip, (uint16_t)dst_port,
+            (uint16_t)preferred_port);
+        if (source_port == 0) {
+            tcp_socket_free(sock);
+            printf("[%s] No available TCP source port\n", host->base.NAME);
+            return true;
+        }
+
+        tcp_socket_connect(sock, &host->ip_address, source_port,
                            &target_ip, (uint16_t)dst_port);
 
         char ip_buf[20];
@@ -635,7 +690,9 @@ bool process(char* command){
             data_len = TCP_MAX_PAYLOAD;
         }
 
-        tcp_socket_send(sock, (const uint8_t*)data, data_len);
+        if (!tcp_socket_send(sock, (const uint8_t*)data, data_len)) {
+            return true;
+        }
 
         // Send data packet
         uint8_t tcp_raw[TCP_HEADER_SIZE + TCP_MAX_PAYLOAD];
@@ -662,8 +719,8 @@ bool process(char* command){
                             IPV4_DEFAULT_TTL, IPV4_PROTOCOL_TCP, tcp_raw, tcp_len)) {
                 size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
                 if (ip_len > 0) {
+                    sock->send_seq += (uint32_t)data_len;
                     host_send_l3_packet(host, &sock->remote_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
-                    sock->send_seq += data_len;
                     printf("[%s] Sent %zu bytes via TCP\n", host->base.NAME, data_len);
                 }
             }
@@ -700,8 +757,8 @@ bool process(char* command){
             return true;
         }
 
-        uint8_t buffer[TCP_MAX_PAYLOAD];
-        int received = tcp_socket_recv(sock, buffer, sizeof(buffer));
+        uint8_t buffer[TCP_MAX_PAYLOAD + 1];
+        int received = tcp_socket_recv(sock, buffer, sizeof(buffer) - 1);
         if (received > 0) {
             buffer[received] = '\0';
             printf("[%s] Received %d bytes: %s\n", host->base.NAME, received, (char*)buffer);
@@ -717,18 +774,19 @@ bool process(char* command){
             return true;
         }
 
-        // Find first ESTABLISHED socket
+        // Find a socket that can actively or passively finish closing.
         TCPSocket* sock = NULL;
         for (int i = 0; i < TCP_MAX_SOCKETS; i++) {
             if (host->tcp_sockets[i].in_use &&
-                host->tcp_sockets[i].state == TCP_ESTABLISHED) {
+                (host->tcp_sockets[i].state == TCP_ESTABLISHED ||
+                 host->tcp_sockets[i].state == TCP_CLOSE_WAIT)) {
                 sock = &host->tcp_sockets[i];
                 break;
             }
         }
 
         if (sock == NULL) {
-            printf("[%s] No established TCP connection\n", host->base.NAME);
+            printf("[%s] No TCP connection available to close\n", host->base.NAME);
             return true;
         }
 
@@ -755,8 +813,11 @@ bool process(char* command){
                             IPV4_DEFAULT_TTL, IPV4_PROTOCOL_TCP, tcp_raw, tcp_len)) {
                 size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
                 if (ip_len > 0) {
+                    if (!tcp_socket_close(sock)) {
+                        return true;
+                    }
+                    sock->send_seq++;
                     host_send_l3_packet(host, &sock->remote_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len);
-                    tcp_socket_close(sock);
                     printf("[%s] TCP connection closing (FIN sent)\n", host->base.NAME);
                 }
             }
@@ -821,13 +882,19 @@ bool process(char* command){
         }
 
         magi_socket_attach_host(sockfd, host);
-        magi_connect(sockfd, &target_ip, (uint16_t)port);
-        host->magi_sock_fd = sockfd;
+        int conn_result = magi_connect(sockfd, &target_ip, (uint16_t)port);
 
         char ip_buf[20];
         ip_to_string(&target_ip, ip_buf, sizeof(ip_buf), false);
-        printf("[%s] MagiSocket connected to %s:%d (fd=%d)\n",
-               host->base.NAME, ip_buf, port, sockfd);
+        if (conn_result < 0) {
+            printf("[%s] MagiSocket connect failed to %s:%d\n",
+                   host->base.NAME, ip_buf, port);
+            magi_close(sockfd);
+        } else {
+            host->magi_sock_fd = sockfd;
+            printf("[%s] MagiSocket connected to %s:%d (fd=%d)\n",
+                   host->base.NAME, ip_buf, port, sockfd);
+        }
         return true;
 
     } else if (count >= 2 && strcmp(tokens[1], "magi_sock_send") == 0) {
@@ -1027,76 +1094,44 @@ bool process(char* command){
             return true;
         }
 
-        if (count < 4) {
-            if (dns_server_resolve(tokens[2], &resolved)) {
-                char ip_buf[20];
-                ip_to_string(&resolved, ip_buf, sizeof(ip_buf), false);
-                printf("[DNS] %s -> %s\n", tokens[2], ip_buf);
-            } else {
-                printf("[DNS] Could not resolve: %s\n", tokens[2]);
-            }
-            return true;
-        }
-
         Host* host;
-        IpAddress server_ip;
         if (!cli_find_host(tokens[0], &host)) {
             printf("Unknown host: %s\n", tokens[0]);
             return true;
         }
-        if (!ip_parse(tokens[3], &server_ip)) {
-            printf("Invalid server IP: %s\n", tokens[3]);
-            return true;
+
+        IpAddress server_ip;
+        bool has_server = false;
+
+        if (count >= 4) {
+            if (!ip_parse(tokens[3], &server_ip)) {
+                printf("Invalid server IP: %s\n", tokens[3]);
+                return true;
+            }
+            has_server = true;
+        } else {
+            // Use the running DNS server's IP if one is attached
+            Host* dns_host = dns_server_get_bound_host();
+            if (dns_host != NULL) {
+                server_ip = dns_host->ip_address;
+                has_server = true;
+            }
         }
 
-        uint8_t query_raw[512];
-        size_t query_len = 0;
-        uint16_t query_id = (uint16_t)((rand() % 0xFFFF) + 1);
-        if (!dns_create_query(query_raw, sizeof(query_raw), &query_len, query_id, tokens[2])) {
-            printf("[DNS] Failed to build query for %s\n", tokens[2]);
-            return true;
-        }
-
-        UDPDatagram udp;
-        udp_init(&udp);
-        udp_create(&udp, 5353, DNS_SERVER_PORT, query_raw, query_len);
-
-        uint8_t udp_raw[UDP_HEADER_SIZE + UDP_MAX_PAYLOAD];
-        size_t udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
-        if (udp_len == 0) {
-            printf("[DNS] UDP serialization failed\n");
-            return true;
-        }
-        udp.checksum = udp_compute_checksum(udp_raw, udp_len, &host->ip_address, &server_ip);
-        udp_len = packet_to_bytes((Packet*)&udp, udp_raw, sizeof(udp_raw));
-
-        uint8_t ip_raw[IPV4_HEADER_SIZE + IPV4_MAX_PAYLOAD];
-        IPv4Packet ip_pkt;
-        if (!ipv4_create(&ip_pkt, host->ip_address, server_ip,
-                         IPV4_DEFAULT_TTL, IPV4_PROTOCOL_UDP, udp_raw, udp_len)) {
-            printf("[DNS] IP packet build failed\n");
-            return true;
-        }
-        size_t ip_len = packet_to_bytes((Packet*)&ip_pkt, ip_raw, sizeof(ip_raw));
-        if (ip_len == 0) {
-            printf("[DNS] IP serialization failed\n");
-            return true;
-        }
-
-        host->has_last_udp = false;
-        if (!host_send_l3_packet(host, &server_ip, ETHERNET_TYPE_IPV4, ip_raw, ip_len)) {
-            printf("[DNS] Failed to send query\n");
-            return true;
-        }
-
-        if (!host->has_last_udp || host->last_udp.src_port != DNS_SERVER_PORT) {
-            printf("[DNS] No DNS response received from %s\n", tokens[3]);
-            return true;
-        }
-
-        if (!dns_parse_response(host->last_udp.payload, host->last_udp.payload_len, &resolved)) {
-            printf("[DNS] Failed to parse response (NXDOMAIN?)\n");
-            return true;
+        int ok = 0;
+        if (has_server) {
+            ok = cli_dns_query(host, tokens[2], &server_ip, &resolved);
+            if (!ok) {
+                printf("[DNS] No response or NXDOMAIN for: %s\n", tokens[2]);
+                return true;
+            }
+        } else {
+            // No server available: fall back to direct table lookup
+            ok = dns_server_resolve(tokens[2], &resolved);
+            if (!ok) {
+                printf("[DNS] Could not resolve: %s\n", tokens[2]);
+                return true;
+            }
         }
 
         char ip_buf[20];
@@ -1144,13 +1179,22 @@ bool process(char* command){
             strncpy(path, "/", sizeof(path) - 1);
         }
 
-        // Resolve hostname
-        if (!dns_server_resolve(hostname, &resolved)) {
-            // Try as IP
-            if (!ip_parse(hostname, &resolved)) {
-                printf("[HTTP] Could not resolve hostname: %s\n", hostname);
-                return true;
+        // Resolve hostname: IP literal → network DNS query → direct table fallback
+        bool resolved_ok = false;
+        if (ip_parse(hostname, &resolved)) {
+            resolved_ok = true;
+        } else {
+            Host* dns_host = dns_server_get_bound_host();
+            if (dns_host != NULL) {
+                resolved_ok = cli_dns_query(host, hostname, &dns_host->ip_address, &resolved);
             }
+            if (!resolved_ok) {
+                resolved_ok = dns_server_resolve(hostname, &resolved);
+            }
+        }
+        if (!resolved_ok) {
+            printf("[HTTP] Could not resolve hostname: %s\n", hostname);
+            return true;
         }
 
         char ip_buf[20];
@@ -1165,7 +1209,11 @@ bool process(char* command){
         }
 
         magi_socket_attach_host(sockfd, host);
-        magi_connect(sockfd, &resolved, HTTP_SERVER_PORT);
+        if (magi_connect(sockfd, &resolved, HTTP_SERVER_PORT) < 0) {
+            printf("[HTTP] Connection to %s:%d failed\n", ip_buf, HTTP_SERVER_PORT);
+            magi_close(sockfd);
+            return true;
+        }
 
         // Build HTTP GET request
         char request[1024];
