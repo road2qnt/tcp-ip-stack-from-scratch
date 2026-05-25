@@ -1752,6 +1752,12 @@ int gui_run(Simulator* simulator)
 
         sim_clock_tick(now_ms);
 
+        for (size_t i = 0; i < state.sim->node_count; i++) {
+            if (state.sim->nodes[i].type == SIM_NODE_ROUTER) {
+                router_poll_arp((Router*)state.sim->nodes[i].node, now_ms);
+            }
+        }
+
         for (size_t i = 0; i < deliver_count; i++) {
             int idx = will_deliver_to[i];
             if (idx >= 0 && idx < (int)state.gnode_count) {
