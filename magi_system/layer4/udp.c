@@ -175,6 +175,10 @@ int udp_from_bytes(UDPDatagram* datagram, const uint8_t* raw, size_t raw_len)
     datagram->length = read_u16_be(raw + 4);
     datagram->checksum = read_u16_be(raw + 6);
 
+    if (datagram->length < UDP_HEADER_SIZE || datagram->length > raw_len) {
+        return 0;
+    }
+
     payload_len = (size_t)datagram->length - UDP_HEADER_SIZE;
     if (payload_len > UDP_MAX_PAYLOAD) {
         return 0;
