@@ -4,6 +4,7 @@
 
 #include "../layer2/host.h"
 #include "../layer2/switch.h"
+#include "../core/sim_clock.h"
 #include "../layer3/router.h"
 #include "../layer3/icmp.h"
 #include "../layer4/udp.h"
@@ -1147,6 +1148,36 @@ void debug_milestone_2(Simulator *sim)
     TEST("SW1 port24 linked", is_linked(&e2e_sim, "SW1:24"));
     TEST_MSG("Link count = 3", e2e_sim.link_count == 3, "got %zu", e2e_sim.link_count);
 
+    if (hidx >= 0 && ridx >= 0) {
+        Host* h1 = (Host*)e2e_sim.nodes[hidx].node;
+        Router* r1 = (Router*)e2e_sim.nodes[ridx].node;
+        uint8_t unknown_octets[] = {8, 8, 8, 8};
+        IpAddress unknown = ip_init(unknown_octets, 32);
+
+        h1->has_last_icmp = false;
+        r = host_send_icmp_echo_request(h1, &unknown, IPV4_DEFAULT_TTL, 1);
+        TEST("Dead next-hop: ping transmission starts", r == 1);
+        TEST("Dead next-hop: host receives ICMP Destination Unreachable",
+             h1->has_last_icmp && h1->last_icmp_type == ICMP_DEST_UNREACHABLE);
+        TEST_MSG("Dead next-hop: router drops failed pending packet",
+                 r1->pending_queue.size == 0,
+                 "got %zu", r1->pending_queue.size);
+
+        uint8_t unlinked_octets[] = {8, 8, 4, 4};
+        IpAddress unlinked_dst = ip_init(unlinked_octets, 32);
+        r = simulator_unlink(&e2e_sim, "H2", "R1:2");
+        TEST("Unlinked next-hop: remove output link", r == 1);
+
+        h1->has_last_icmp = false;
+        r = host_send_icmp_echo_request(h1, &unlinked_dst, IPV4_DEFAULT_TTL, 2);
+        TEST("Unlinked next-hop: ping transmission starts", r == 1);
+        TEST("Unlinked next-hop: host receives ICMP Destination Unreachable",
+             h1->has_last_icmp && h1->last_icmp_type == ICMP_DEST_UNREACHABLE);
+        TEST_MSG("Unlinked next-hop: router drops failed pending packet",
+                 r1->pending_queue.size == 0,
+                 "got %zu", r1->pending_queue.size);
+    }
+
     simulator_clear(&e2e_sim);
 
     // ========================================
@@ -1187,6 +1218,9 @@ void debug_milestone_2(Simulator *sim)
     Interface* iface1 = node_get_interface(&fwd_router.base, 1);
     Interface* iface2 = node_get_interface(&fwd_router.base, 2);
     MacAddress broadcast = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+    bool was_realtime = sim_clock_realtime_enabled();
+
+    sim_clock_set_realtime(true);
 
     // Create a small ICMP Echo payload to use as IPv4 payload
     uint8_t icmp_payload_raw[ICMP_HEADER_SIZE + ICMP_MAX_PAYLOAD];
@@ -1396,6 +1430,7 @@ void debug_milestone_2(Simulator *sim)
                  "got %zu", fwd_router.arp_table.size);
     }
 
+    sim_clock_set_realtime(was_realtime);
     test_report_footer();
 }
 
@@ -1455,6 +1490,16 @@ void debug_milestone_3(Simulator *sim)
     IpAddress wrong_ip = ip_init(ip_b, 24);
     bool invalid = udp_validate_checksum(&udp, &wrong_ip, &dst_ip);
     TEST("UDP checksum fails with wrong src IP", !invalid);
+
+    // T5b: UDP parser rejects malformed length fields before copying payload.
+    uint8_t malformed_udp[UDP_HEADER_SIZE + 1] = {0};
+    malformed_udp[4] = 0;
+    malformed_udp[5] = UDP_HEADER_SIZE - 1;
+    r = udp_from_bytes(&udp2, malformed_udp, sizeof(malformed_udp));
+    TEST("UDP rejects length smaller than header", r == 0);
+    malformed_udp[5] = UDP_HEADER_SIZE + 2;
+    r = udp_from_bytes(&udp2, malformed_udp, sizeof(malformed_udp));
+    TEST("UDP rejects length larger than received bytes", r == 0);
 
     // ========================================
     printf("\n" ANSI_YELLOW "  --- TCP Segment Tests ---\n" ANSI_RESET);
@@ -1570,6 +1615,9 @@ void debug_milestone_3(Simulator *sim)
     TEST("Server state = SYN_RECEIVED after SYN", server->state == TCP_SYN_RECEIVED);
     TEST("Server responds with SYN-ACK", syn_ack_response.flags == TCP_FLAG_SYN_ACK);
     TEST("Server ack_num = client_seq + 1", syn_ack_response.ack_num == 1001);
+    server->remote_ip = src_ip;
+    server->remote_port = 12345;
+    server->is_listening = false;
 
     // Step 3: Client receives SYN-ACK -> sends ACK
     // First, allocate a child socket for the client side
@@ -1578,8 +1626,6 @@ void debug_milestone_3(Simulator *sim)
     // Set up as client connecting TO dst_ip:80 FROM src_ip:12345
     tcp_socket_connect(child, &src_ip, 12345, &dst_ip, 80);
     child->state = TCP_SYN_SENT;
-    child->send_seq = 2000;
-    child->recv_seq = 0;
 
     TCPSegment ack_response;
     tcp_init(&ack_response);
@@ -1588,6 +1634,230 @@ void debug_milestone_3(Simulator *sim)
     TEST("Client state = ESTABLISHED after SYN-ACK", child->state == TCP_ESTABLISHED);
     TEST("Client sends ACK", ack_response.flags == TCP_FLAG_ACK);
     TEST_MSG("Client ack_num = server_seq + 1", ack_response.ack_num == syn_ack_response.seq_num + 1, "got %u", ack_response.ack_num);
+
+    TCPSegment no_response;
+    tcp_init(&no_response);
+    r = tcp_socket_receive_segment(server, &ack_response, &src_ip, &dst_ip, &no_response);
+    TEST("Server handles final handshake ACK", r == 1);
+    TEST("Server state = ESTABLISHED after final ACK", server->state == TCP_ESTABLISHED);
+    TEST_MSG("Server SYN consumes one send sequence number",
+             server->send_seq == syn_ack_response.seq_num + 1,
+             "got %u", server->send_seq);
+
+    int strict_idx = tcp_socket_alloc(sockets, TCP_MAX_SOCKETS);
+    TCPSocket* strict_client = &sockets[strict_idx];
+    tcp_socket_connect(strict_client, &src_ip, 22000, &dst_ip, 80);
+    TCPSegment invalid_syn_ack = syn_ack_response;
+    invalid_syn_ack.dst_port = strict_client->local_port;
+    invalid_syn_ack.ack_num = strict_client->send_seq + 2;
+    invalid_syn_ack.checksum = 0;
+    {
+        uint8_t seg_raw[TCP_HEADER_SIZE];
+        size_t seg_len = packet_to_bytes((Packet*)&invalid_syn_ack, seg_raw, sizeof(seg_raw));
+        invalid_syn_ack.checksum = tcp_compute_checksum(seg_raw, seg_len, &dst_ip, &src_ip);
+    }
+    tcp_init(&no_response);
+    r = tcp_socket_receive_segment(strict_client, &invalid_syn_ack,
+                                   &dst_ip, &src_ip, &no_response);
+    TEST("Client rejects SYN-ACK with invalid acknowledgment", r == 0);
+    TEST("Invalid SYN-ACK leaves client in SYN_SENT", strict_client->state == TCP_SYN_SENT);
+
+    printf("\n" ANSI_YELLOW "  --- TCP Receive Buffer & Reassembly Tests ---\n" ANSI_RESET);
+
+    TCPSegment data_segment;
+    TCPSegment data_ack;
+    uint8_t recv_data[32];
+
+    tcp_create(&data_segment, child->local_port, server->local_port, 1001,
+               child->recv_seq, TCP_FLAG_ACK | TCP_FLAG_PSH, TCP_WINDOW_SIZE,
+               (const uint8_t*)"First", 5);
+    {
+        uint8_t seg_raw[TCP_HEADER_SIZE + TCP_MAX_PAYLOAD];
+        size_t seg_len = packet_to_bytes((Packet*)&data_segment, seg_raw, sizeof(seg_raw));
+        data_segment.checksum = tcp_compute_checksum(seg_raw, seg_len, &src_ip, &dst_ip);
+    }
+    tcp_init(&data_ack);
+    r = tcp_socket_receive_segment(server, &data_segment, &src_ip, &dst_ip, &data_ack);
+    TEST("TCP receives first stream segment", r == 1);
+
+    tcp_create(&data_segment, child->local_port, server->local_port, 1006,
+               child->recv_seq, TCP_FLAG_ACK | TCP_FLAG_PSH, TCP_WINDOW_SIZE,
+               (const uint8_t*)"Second", 6);
+    {
+        uint8_t seg_raw[TCP_HEADER_SIZE + TCP_MAX_PAYLOAD];
+        size_t seg_len = packet_to_bytes((Packet*)&data_segment, seg_raw, sizeof(seg_raw));
+        data_segment.checksum = tcp_compute_checksum(seg_raw, seg_len, &src_ip, &dst_ip);
+    }
+    tcp_init(&data_ack);
+    r = tcp_socket_receive_segment(server, &data_segment, &src_ip, &dst_ip, &data_ack);
+    TEST("TCP receives second stream segment", r == 1);
+    r = tcp_socket_recv(server, recv_data, sizeof(recv_data));
+    TEST_MSG("TCP receive buffer concatenates segments",
+             r == 11 && memcmp(recv_data, "FirstSecond", 11) == 0,
+             "got %d bytes", r);
+
+    tcp_create(&data_segment, child->local_port, server->local_port, 1017,
+               child->recv_seq, TCP_FLAG_ACK | TCP_FLAG_PSH, TCP_WINDOW_SIZE,
+               (const uint8_t*)"World", 5);
+    {
+        uint8_t seg_raw[TCP_HEADER_SIZE + TCP_MAX_PAYLOAD];
+        size_t seg_len = packet_to_bytes((Packet*)&data_segment, seg_raw, sizeof(seg_raw));
+        data_segment.checksum = tcp_compute_checksum(seg_raw, seg_len, &src_ip, &dst_ip);
+    }
+    tcp_init(&data_ack);
+    tcp_socket_receive_segment(server, &data_segment, &src_ip, &dst_ip, &data_ack);
+    TEST("Out-of-order segment is held until gap arrives", !server->has_data);
+
+    tcp_create(&data_segment, child->local_port, server->local_port, 1012,
+               child->recv_seq, TCP_FLAG_ACK | TCP_FLAG_PSH, TCP_WINDOW_SIZE,
+               (const uint8_t*)"Hello", 5);
+    {
+        uint8_t seg_raw[TCP_HEADER_SIZE + TCP_MAX_PAYLOAD];
+        size_t seg_len = packet_to_bytes((Packet*)&data_segment, seg_raw, sizeof(seg_raw));
+        data_segment.checksum = tcp_compute_checksum(seg_raw, seg_len, &src_ip, &dst_ip);
+    }
+    tcp_init(&data_ack);
+    tcp_socket_receive_segment(server, &data_segment, &src_ip, &dst_ip, &data_ack);
+    r = tcp_socket_recv(server, recv_data, sizeof(recv_data));
+    TEST_MSG("TCP reassembles out-of-order segments",
+             r == 10 && memcmp(recv_data, "HelloWorld", 10) == 0,
+             "got %d bytes", r);
+
+    r = tcp_socket_send(server, (const uint8_t*)"Reply", 5);
+    TEST("Server can buffer data after handshake", r == 1);
+    server->send_seq += 5;
+    tcp_create(&data_segment, child->local_port, server->local_port, child->send_seq,
+               server->send_seq, TCP_FLAG_ACK, TCP_WINDOW_SIZE, NULL, 0);
+    {
+        uint8_t seg_raw[TCP_HEADER_SIZE];
+        size_t seg_len = packet_to_bytes((Packet*)&data_segment, seg_raw, sizeof(seg_raw));
+        data_segment.checksum = tcp_compute_checksum(seg_raw, seg_len, &src_ip, &dst_ip);
+    }
+    tcp_init(&data_ack);
+    tcp_socket_receive_segment(server, &data_segment, &src_ip, &dst_ip, &data_ack);
+    TEST_MSG("Server payload acknowledgment clears complete send buffer",
+             server->send_buffer.size == 0,
+             "got %zu remaining", server->send_buffer.size);
+
+    printf("\n" ANSI_YELLOW "  --- TCP 4-Way Teardown Tests ---\n" ANSI_RESET);
+
+    TCPSocket fin_data_receiver;
+    memset(&fin_data_receiver, 0, sizeof(fin_data_receiver));
+    fin_data_receiver.in_use = true;
+    fin_data_receiver.state = TCP_ESTABLISHED;
+    fin_data_receiver.local_ip = dst_ip;
+    fin_data_receiver.local_port = 80;
+    fin_data_receiver.remote_ip = src_ip;
+    fin_data_receiver.remote_port = 30001;
+    fin_data_receiver.send_seq = 9000;
+    fin_data_receiver.send_ack = 9000;
+    fin_data_receiver.recv_seq = 4000;
+    TCPSegment fin_with_data;
+    TCPSegment fin_with_data_ack;
+    tcp_create(&fin_with_data, fin_data_receiver.remote_port, fin_data_receiver.local_port,
+               4000, fin_data_receiver.send_seq, TCP_FLAG_FIN | TCP_FLAG_ACK,
+               TCP_WINDOW_SIZE, (const uint8_t*)"End", 3);
+    {
+        uint8_t seg_raw[TCP_HEADER_SIZE + TCP_MAX_PAYLOAD];
+        size_t seg_len = packet_to_bytes((Packet*)&fin_with_data, seg_raw, sizeof(seg_raw));
+        fin_with_data.checksum = tcp_compute_checksum(seg_raw, seg_len, &src_ip, &dst_ip);
+    }
+    tcp_init(&fin_with_data_ack);
+    r = tcp_socket_receive_segment(&fin_data_receiver, &fin_with_data,
+                                   &src_ip, &dst_ip, &fin_with_data_ack);
+    TEST("FIN carrying data enters CLOSE_WAIT after delivering payload",
+         r == 1 && fin_data_receiver.state == TCP_CLOSE_WAIT);
+    r = tcp_socket_recv(&fin_data_receiver, recv_data, sizeof(recv_data));
+    TEST_MSG("FIN carrying data preserves payload before closing",
+             r == 3 && memcmp(recv_data, "End", 3) == 0 &&
+             fin_with_data_ack.ack_num == 4004,
+             "got %d bytes and ACK %u", r, fin_with_data_ack.ack_num);
+
+    TCPSocket close_sockets[2];
+    tcp_socket_init(close_sockets, 2);
+    TCPSocket* closer = &close_sockets[0];
+    TCPSocket* peer = &close_sockets[1];
+    closer->in_use = true;
+    closer->state = TCP_ESTABLISHED;
+    closer->local_ip = src_ip;
+    closer->local_port = 30000;
+    closer->remote_ip = dst_ip;
+    closer->remote_port = 80;
+    closer->send_seq = 5000;
+    closer->send_ack = 5000;
+    closer->recv_seq = 7000;
+    peer->in_use = true;
+    peer->state = TCP_ESTABLISHED;
+    peer->local_ip = dst_ip;
+    peer->local_port = 80;
+    peer->remote_ip = src_ip;
+    peer->remote_port = 30000;
+    peer->send_seq = 7000;
+    peer->send_ack = 7000;
+    peer->recv_seq = 5000;
+
+    TCPSegment fin;
+    TCPSegment fin_ack;
+    tcp_create(&fin, closer->local_port, closer->remote_port, closer->send_seq,
+               closer->recv_seq, TCP_FLAG_FIN | TCP_FLAG_ACK, TCP_WINDOW_SIZE,
+               NULL, 0);
+    {
+        uint8_t seg_raw[TCP_HEADER_SIZE];
+        size_t seg_len = packet_to_bytes((Packet*)&fin, seg_raw, sizeof(seg_raw));
+        fin.checksum = tcp_compute_checksum(seg_raw, seg_len, &src_ip, &dst_ip);
+    }
+    r = tcp_socket_close(closer);
+    closer->send_seq++;
+    TEST("Active close enters FIN_WAIT_1 before FIN delivery", r == 1 && closer->state == TCP_FIN_WAIT_1);
+    tcp_init(&fin_ack);
+    r = tcp_socket_receive_segment(peer, &fin, &src_ip, &dst_ip, &fin_ack);
+    TEST("Peer accepts FIN and enters CLOSE_WAIT", r == 1 && peer->state == TCP_CLOSE_WAIT);
+    tcp_init(&no_response);
+    r = tcp_socket_receive_segment(closer, &fin_ack, &dst_ip, &src_ip, &no_response);
+    TEST("ACK for initial FIN enters FIN_WAIT_2", r == 1 && closer->state == TCP_FIN_WAIT_2);
+
+    tcp_create(&fin, peer->local_port, peer->remote_port, peer->send_seq,
+               peer->recv_seq, TCP_FLAG_FIN | TCP_FLAG_ACK, TCP_WINDOW_SIZE,
+               NULL, 0);
+    {
+        uint8_t seg_raw[TCP_HEADER_SIZE];
+        size_t seg_len = packet_to_bytes((Packet*)&fin, seg_raw, sizeof(seg_raw));
+        fin.checksum = tcp_compute_checksum(seg_raw, seg_len, &dst_ip, &src_ip);
+    }
+    r = tcp_socket_close(peer);
+    peer->send_seq++;
+    TEST("Passive close enters LAST_ACK before FIN delivery", r == 1 && peer->state == TCP_LAST_ACK);
+    tcp_init(&fin_ack);
+    r = tcp_socket_receive_segment(closer, &fin, &dst_ip, &src_ip, &fin_ack);
+    TEST("Final FIN places active closer in TIME_WAIT", r == 1 && closer->state == TCP_TIME_WAIT);
+    tcp_init(&no_response);
+    r = tcp_socket_receive_segment(peer, &fin_ack, &src_ip, &dst_ip, &no_response);
+    TEST("Final ACK closes passive peer", r == 1 && peer->state == TCP_CLOSED);
+    TEST("Final ACK releases passive peer socket slot", !peer->in_use);
+
+    uint16_t reconnect_port = tcp_socket_select_source_port(
+        close_sockets, 2, &dst_ip, 80, closer->local_port);
+    TEST("Reconnect avoids a four-tuple still in TIME_WAIT",
+         reconnect_port != 0 && reconnect_port != closer->local_port);
+
+    Host port_owner;
+    memset(&port_owner, 0, sizeof(port_owner));
+    tcp_socket_init(port_owner.tcp_sockets, TCP_MAX_SOCKETS);
+    uint16_t first_port = host_select_tcp_source_port(&port_owner, &dst_ip, 80, 2080);
+    uint16_t second_port = host_select_tcp_source_port(&port_owner, &dst_ip, 80, 2080);
+    TEST("Host source-port cursor avoids immediate reuse after passive close",
+         first_port == 2080 && second_port == 2081);
+
+    TCPSocket bounded_pool[2];
+    tcp_socket_init(bounded_pool, 2);
+    bounded_pool[0].in_use = true;
+    bounded_pool[0].is_listening = true;
+    bounded_pool[0].state = TCP_LISTEN;
+    bounded_pool[1].in_use = true;
+    bounded_pool[1].state = TCP_TIME_WAIT;
+    r = tcp_socket_alloc(bounded_pool, 2);
+    TEST("Full bounded socket pool can recycle TIME_WAIT storage",
+         r == 1 && bounded_pool[1].state == TCP_CLOSED);
 
     // ========================================
     printf("\n" ANSI_YELLOW "  --- TCP State Transition Tests ---\n" ANSI_RESET);
