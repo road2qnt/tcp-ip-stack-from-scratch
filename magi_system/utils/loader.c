@@ -4,6 +4,10 @@
 #include "../layer2/host.h"
 #include "../layer2/switch.h"
 #include "../layer3/router.h"
+#include "../layer7/magi_socket.h"
+#include "../layer7/http_server.h"
+#include "../layer7/dhcp_server.h"
+#include "../layer7/dns_server.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -227,6 +231,12 @@ int simulator_load(Simulator *simulator, const char *filename)
         json_free(root);
         return 0;
     }
+
+    // Reset all layer-7 services before freeing nodes 
+    http_server_stop();
+    dhcp_server_detach_host();
+    dns_server_detach_host();
+    magi_socket_reset_all();
 
     // Clear current simulator state
     simulator_clear(simulator);
