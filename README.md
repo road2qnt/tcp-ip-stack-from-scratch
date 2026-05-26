@@ -103,22 +103,22 @@ Perintah yang tersedia:
 * [x] **Milestone 1: Data Link Layer (L2)** `[v0.1.1]` — Implementasi *Ethernet Frame*, logika *Switching* (*VLAN-aware*), dan antrean IP Packet menggunakan *ARP Cache*. *(Tests: 18/18)*
 * [x] **Milestone 2: Network Layer (L3)** `[v0.2.1]` — Implementasi resolusi *Longest Prefix Match Routing*, modifikasi parameter TTL, kalkulasi *Checksum* IPv4, dan pengiriman *ICMP Error Messages*. *(Tests: 172/172)*
 * [x] **Milestone 3: Transport Layer (L4)** `[v0.3.1]` — Penyusunan *State Machine* TCP (*3-Way Handshake*, *Receive Buffers*, *4-Way Teardown*), protokol UDP, dan kalkulasi *Pseudo-Header*. *(Tests: 60/60)*
-* [ ] **Milestone 4: Application Layer (L7)** — Pembuatan *Wrapper API* `MagiSocket` untuk mengabstraksi komunikasi OS, serta perakitan layanan mandiri DHCP, DNS, dan server HTTP.
-* [ ] **Milestone 5: Fitur Bonus** — *Topology Visualizer*, *ACL Firewall*, *NAT/PAT*, *RIPv2*, *GUI Dashboard*.
+* [x] **Milestone 4: Application Layer (L7)** — Pembuatan *Wrapper API* `MagiSocket` untuk mengabstraksi komunikasi OS, serta perakitan layanan mandiri DHCP, DNS, dan server HTTP.
+* [x] **Milestone 5: Fitur Bonus** — *Topology Visualizer*,*GUI Dashboard*.
 
 ## Pembagian Tugas
 
 > Berdasarkan analisis riwayat kontribusi kode (`git log`).
 
-| No | NPM | Nama | Kontribusi |
-|----|-----|------|------------|
-| 1 | 13524115 | **Ega Luthfi Rais** | M3 Transport Layer (UDP, TCP, TCP Socket State Machine), M2 Integration (Host, Router, IPv4, ICMP), Debugger Suite, CLI Commands, Middleboxes (NAT, ACL), GUI, Topology Visualizer, Layer 7 stubs (DHCP, DNS, HTTP, MagiSocket, RIP), Build System, Utils (JSON, Loader, Visualizer) |
-| 2 | 13524141 | Ahmad Fauzan Putra | bug fixes M1, M2, M4. GUI, Topology visualizer |
-| 3 | 13524146 | **Leonardus Brain Fatolosja** | M0 Fondasi Simulasi (Interface, Link, MAC, Packet, Data Structures), M1 Data Link Layer (Ethernet, ARP, Switch, Host), M2 Network Layer (IPv4, ICMP, Router), CLI & Visualizer awal, Makefile & Project Structure |
-| 4 | 13524134 | Salman Faiz Assidqi | — |
-| 5 | 13524124 | Zahran Alvan Putra Winarko | — |
+| No | NPM | Nama | Kontribusi | Persentase |
+|----|-----|------|------------|------------|
+| 1 | 13524115 | **Ega Luthfi Rais** | M3 Transport Layer (UDP, TCP, TCP Socket State Machine), M2 Integration (Host, Router, IPv4, ICMP), Debugger Suite, CLI Commands, Middleboxes (NAT, ACL), GUI, Topology Visualizer, Layer 7 stubs (DHCP, DNS, HTTP, MagiSocket, RIP), Build System, Utils (JSON, Loader, Visualizer) | 33,33% |
+| 2 | 13524141 | Ahmad Fauzan Putra | bug fixes M1, M2, M4. GUI, Topology visualizer | 33,33% |
+| 3 | 13524146 | **Leonardus Brain Fatolosja** | M0 Fondasi Simulasi (Interface, Link, MAC, Packet, Data Structures), M1 Data Link Layer (Ethernet, ARP, Switch, Host), M2 Network Layer (IPv4, ICMP, Router), CLI & Visualizer awal, Makefile & Project Structure | 33,33% |
+| 4 | 13524134 | Salman Faiz Assidqi | — | 0% |
+| 5 | 13524124 | Zahran Alvan Putra Winarko | — | 0% |
 
-> **Catatan:** Anggota dengan kontribusi "—" belum terdeteksi aktivitas di git history. Silakan diperbarui sesuai peran masing-masing.
+> **Catatan:** Anggota dengan kontribusi "—" diberi bobot kontribusi 0%. Anggota lainnya mendapat bobot setara; jumlah 99,99% terjadi karena pembulatan desimal.
 
 ## Struktur Proyek
 
@@ -138,24 +138,6 @@ magi_system/
 └── topology.json      # Default topology
 ```
 
-## Status Test Suite
-
-```
-╔══════════════════════════════════════════════╗
-║           TEST SUMMARY                       ║
-╠══════════════════════════════════════════════╣
-║  Total tests:                          300  ║
-║  Passed:                               300  ║
-║  Failed:                                 0  ║
-╚══════════════════════════════════════════════╝
-
-M0 (Fondasi Simulasi):     50/50  ✅
-M1 (Data Link Layer):      18/18  ✅
-M2 (Network Layer):       172/172 ✅
-M3 (Transport Layer):      60/60  ✅
-M4 (Application Layer):     0/0   ⏳
-```
-
 ## GitHub Releases
 
 | Milestone | Tag | Rilis |
@@ -164,3 +146,4 @@ M4 (Application Layer):     0/0   ⏳
 | M1: Data Link Layer | `v0.1.1` | [Lihat Release](https://github.com/labsister23/tugas-besar-jarkom-abg_hunter/releases/tag/v0.1.1) |
 | M2: Network Layer | `v0.2.1` | [Lihat Release](https://github.com/labsister23/tugas-besar-jarkom-abg_hunter/releases/tag/v0.2.1) |
 | M3: Transport Layer | `v0.3.1` | [Lihat Release](https://github.com/labsister23/tugas-besar-jarkom-abg_hunter/releases/tag/v0.3.1) |
+| M4: Application Layer | `v1.0.0` | [Lihat Release](https://github.com/labsister23/tugas-besar-jarkom-abg_hunter/releases/tag/v1.0.0) |
