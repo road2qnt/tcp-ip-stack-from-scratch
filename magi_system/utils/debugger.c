@@ -510,12 +510,6 @@ void debug_milestone_1(Simulator *sim)
     TEST("Trunk Port 4 allows VLAN 10", switch_port_allows_vlan(sw, 4, 10));
     TEST("Trunk Port 4 allows VLAN 99", switch_port_allows_vlan(sw, 4, 99));
 
-    printf("\n" ANSI_YELLOW "  --- FEATURE NOT YET IMPLEMENTED ---\n" ANSI_RESET);
-    printf("  The following features require further implementation:\n");
-    printf("    - Ethernet frame serialization (to_bytes / from_bytes)\n");
-    printf("    - ARP message serialization\n");
-    printf("    - Host receive handler (vtable)\n");
-    printf("    - Switch receive handler (frame forwarding/flooding)\n");        printf("    - ARP resolution + automatic queue flush on ARP reply\n\n");
 
     simulator_clear(sim);
     test_report_footer();
@@ -1151,6 +1145,20 @@ void debug_milestone_2(Simulator *sim)
     if (hidx >= 0 && ridx >= 0) {
         Host* h1 = (Host*)e2e_sim.nodes[hidx].node;
         Router* r1 = (Router*)e2e_sim.nodes[ridx].node;
+        uint8_t local_unknown_octets[] = {192, 168, 1, 99};
+        IpAddress local_unknown = ip_init(local_unknown_octets, 24);
+
+        h1->has_last_icmp = false;
+        r = host_send_icmp_echo_request(h1, &local_unknown, IPV4_DEFAULT_TTL, 1);
+        TEST("Same-subnet unknown host: ping transmission starts", r == 1);
+        TEST("Same-subnet unknown host: reports Destination Host Unreachable",
+             h1->has_last_icmp &&
+             h1->last_icmp_type == ICMP_DEST_UNREACHABLE &&
+             h1->last_icmp_code == 1);
+        TEST_MSG("Same-subnet unknown host: host drops failed pending packet",
+                 h1->pending_queue.size == 0,
+                 "got %zu", h1->pending_queue.size);
+
         uint8_t unknown_octets[] = {8, 8, 8, 8};
         IpAddress unknown = ip_init(unknown_octets, 32);
 
