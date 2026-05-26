@@ -136,7 +136,7 @@ static int router_send_ethernet_frame(
         return 0;
     }
 
-    send(iface, raw, raw_len);
+    interface_send(iface, raw, raw_len);
     return 1;
 }
 

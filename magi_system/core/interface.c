@@ -22,7 +22,7 @@ Interface interface_init(int num, MacAddress mac){
     return inter;
 }
 
-void send(Interface* sender, const uint8_t* raw, size_t raw_len){
+void interface_send(Interface* sender, const uint8_t* raw, size_t raw_len){
     if (sender == NULL || sender->link == NULL || raw == NULL) {
         return;
     }

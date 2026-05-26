@@ -52,7 +52,7 @@ static int switch_send_frame_on_port(Switch* sw, int out_port, int vlan_id, cons
         return 0;
     }
 
-    send(out_interface, raw, raw_len);
+    interface_send(out_interface, raw, raw_len);
     return 1;
 }
 

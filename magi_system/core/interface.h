@@ -28,7 +28,7 @@ typedef struct Interface{
 } Interface;
 
 Interface interface_init(int num, MacAddress mac);
-void send(Interface* sender, const uint8_t* raw, size_t raw_len);
+void interface_send(Interface* sender, const uint8_t* raw, size_t raw_len);
 void receive(Interface* receiver, const uint8_t* raw, size_t raw_len);
 
 // Abstract Class

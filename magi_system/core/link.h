@@ -7,7 +7,7 @@
 typedef struct Link {
     /*
         1. Data delay untuk simulasi real.
-        2. Panggil send () di interface pengirim dan receive() di interface penerima
+        2. Panggil interface_send() di interface pengirim dan receive() di interface penerima
         3. Menyimpan interface2 yang dihubungkan
     */
     // Node interface 1

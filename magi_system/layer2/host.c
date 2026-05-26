@@ -120,7 +120,7 @@ static int host_send_ethernet_frame(
         return 0;
     }
 
-    send(&host->base.interfaces[0], raw, raw_len);
+    interface_send(&host->base.interfaces[0], raw, raw_len);
     return 1;
 }
 
