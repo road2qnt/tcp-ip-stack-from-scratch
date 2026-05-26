@@ -1755,6 +1755,8 @@ int gui_run(Simulator* simulator)
         for (size_t i = 0; i < state.sim->node_count; i++) {
             if (state.sim->nodes[i].type == SIM_NODE_ROUTER) {
                 router_poll_arp((Router*)state.sim->nodes[i].node, now_ms);
+            } else if (state.sim->nodes[i].type == SIM_NODE_HOST) {
+                host_poll_arp((Host*)state.sim->nodes[i].node, now_ms);
             }
         }
 

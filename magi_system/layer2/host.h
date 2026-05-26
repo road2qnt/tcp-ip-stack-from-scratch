@@ -11,12 +11,16 @@
 #include <time.h>
 
 #define HOST_PENDING_QUEUE_MAX_ENTRIES 64
+#define HOST_ARP_MAX_ATTEMPTS 3
+#define HOST_ARP_RETRY_INTERVAL_MS 1000.0
 
 typedef struct HostPendingPacket {
     IpAddress target_ip;
     uint16_t ethertype;
     uint8_t payload[ETHERNET_MAX_PAYLOAD];
     size_t payload_len;
+    unsigned int arp_attempts;
+    double arp_last_attempt_ms;
 } HostPendingPacket;
 
 typedef struct HostPendingQueue {
@@ -33,6 +37,7 @@ typedef struct Host{
     IpAddress default_gateway;
     bool has_ip;
     uint8_t last_icmp_type;
+    uint8_t last_icmp_code;
     IpAddress last_icmp_source;
     uint16_t last_icmp_sequence;
     bool has_last_icmp;
@@ -69,6 +74,7 @@ int host_learn_arp(Host* host, const ARPMessage* message);
 int host_send_l3_packet(Host* host, const IpAddress* target_ip, uint16_t ethertype, const uint8_t* payload, size_t payload_len);
 int host_flush_pending_packets(Host* host, const IpAddress* resolved_ip);
 int host_send_icmp_echo_request(Host* host, const IpAddress* target_ip, uint8_t ttl, uint16_t sequence);
+void host_poll_arp(Host* host, double now_ms);
 uint16_t host_select_tcp_source_port(Host* host, const IpAddress* remote_ip,
                                      uint16_t remote_port, uint16_t initial_preferred);
 

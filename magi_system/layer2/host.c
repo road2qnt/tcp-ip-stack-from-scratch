@@ -374,6 +374,7 @@ static void host_receive(Node* self, Interface* in_interface, const uint8_t* raw
             }
 
             host->last_icmp_type = icmp.type;
+            host->last_icmp_code = icmp.code;
             host->last_icmp_source = ip_packet.src_ip;
             host->last_icmp_sequence = icmp.sequence;
             host->has_last_icmp = true;
@@ -430,7 +431,8 @@ static void host_receive(Node* self, Interface* in_interface, const uint8_t* raw
 
             if (icmp.type == ICMP_DEST_UNREACHABLE) {
                 host_record_icmp_rtt(host);
-                printf("%s: ICMP Destination Unreachable from ", host->base.NAME);
+                printf("%s: ICMP Destination%s Unreachable from ", host->base.NAME,
+                       icmp.code == 1 ? " Host" : "");
                 print_ip_address(&ip_packet.src_ip);
                 printf(" time=%.1fms\n", host->last_icmp_rtt_ms);
                 return;
@@ -467,6 +469,7 @@ void host_init_with_macs(Host* host, int num_interfaces, const MacAddress* mac_a
     host->has_ip = false;
     host->has_last_icmp = false;
     host->last_icmp_type = 0;
+    host->last_icmp_code = 0;
     host->last_icmp_sequence = 0;
     host->icmp_in_flight = false;
     host->last_icmp_rtt_ms = 0.0;
@@ -491,7 +494,15 @@ void host_pending_queue_init(HostPendingQueue* queue)
     queue->size = 0;
 }
 
-int host_queue_pending_packet(Host* host, const IpAddress* target_ip, uint16_t ethertype, const uint8_t* payload, size_t payload_len)
+static int host_queue_pending_packet_with_arp_state(
+    Host* host,
+    const IpAddress* target_ip,
+    uint16_t ethertype,
+    const uint8_t* payload,
+    size_t payload_len,
+    unsigned int arp_attempts,
+    double arp_last_attempt_ms
+)
 {
     HostPendingQueue* queue;
     HostPendingPacket* item;
@@ -510,11 +521,19 @@ int host_queue_pending_packet(Host* host, const IpAddress* target_ip, uint16_t e
     item->ethertype = ethertype;
     memcpy(item->payload, payload, payload_len);
     item->payload_len = payload_len;
+    item->arp_attempts = arp_attempts;
+    item->arp_last_attempt_ms = arp_last_attempt_ms;
 
     queue->tail = (queue->tail + 1) % HOST_PENDING_QUEUE_MAX_ENTRIES;
     queue->size++;
 
     return 1;
+}
+
+int host_queue_pending_packet(Host* host, const IpAddress* target_ip, uint16_t ethertype, const uint8_t* payload, size_t payload_len)
+{
+    return host_queue_pending_packet_with_arp_state(
+        host, target_ip, ethertype, payload, payload_len, 0, 0.0);
 }
 
 int host_dequeue_pending_packet_for_ip(Host* host, const IpAddress* target_ip, HostPendingPacket* out_packet)
@@ -571,6 +590,50 @@ size_t host_pending_count_for_ip(const Host* host, const IpAddress* target_ip)
     return count;
 }
 
+static HostPendingPacket* host_find_pending_for_ip(Host* host, const IpAddress* target_ip)
+{
+    size_t index;
+
+    if (host == NULL || target_ip == NULL) {
+        return NULL;
+    }
+
+    index = host->pending_queue.head;
+    for (size_t i = 0; i < host->pending_queue.size; i++) {
+        HostPendingPacket* pending = &host->pending_queue.items[index];
+        if (ip_octets_equal(&pending->target_ip, target_ip)) {
+            return pending;
+        }
+        index = (index + 1) % HOST_PENDING_QUEUE_MAX_ENTRIES;
+    }
+
+    return NULL;
+}
+
+static void host_set_arp_attempt_for_ip(
+    Host* host,
+    const IpAddress* target_ip,
+    unsigned int arp_attempts,
+    double attempt_ms
+)
+{
+    size_t index;
+
+    if (host == NULL || target_ip == NULL) {
+        return;
+    }
+
+    index = host->pending_queue.head;
+    for (size_t i = 0; i < host->pending_queue.size; i++) {
+        HostPendingPacket* pending = &host->pending_queue.items[index];
+        if (ip_octets_equal(&pending->target_ip, target_ip)) {
+            pending->arp_attempts = arp_attempts;
+            pending->arp_last_attempt_ms = attempt_ms;
+        }
+        index = (index + 1) % HOST_PENDING_QUEUE_MAX_ENTRIES;
+    }
+}
+
 int host_learn_arp(Host* host, const ARPMessage* message)
 {
     if (host == NULL || message == NULL) {
@@ -584,6 +647,8 @@ int host_send_l3_packet(Host* host, const IpAddress* target_ip, uint16_t etherty
 {
     const IpAddress* next_hop_ip;
     const MacAddress* next_hop_mac;
+    HostPendingPacket* existing_pending;
+    double now_ms;
 
     if (host == NULL || target_ip == NULL || payload == NULL || payload_len > ETHERNET_MAX_PAYLOAD) {
         return 0;
@@ -622,11 +687,35 @@ int host_send_l3_packet(Host* host, const IpAddress* target_ip, uint16_t etherty
     print_ip_address(next_hop_ip);
     printf(", queueing packet\n");
 
-    if (!host_queue_pending_packet(host, next_hop_ip, ethertype, payload, payload_len)) {
+    existing_pending = host_find_pending_for_ip(host, next_hop_ip);
+    now_ms = sim_clock_now_ms();
+    if (!host_queue_pending_packet_with_arp_state(
+            host,
+            next_hop_ip,
+            ethertype,
+            payload,
+            payload_len,
+            existing_pending == NULL ? 1u : existing_pending->arp_attempts,
+            existing_pending == NULL ? now_ms : existing_pending->arp_last_attempt_ms)) {
         return 0;
     }
 
-    return host_send_arp_request(host, next_hop_ip);
+    if (existing_pending != NULL) {
+        return 1;
+    }
+
+    if (!host_send_arp_request(host, next_hop_ip)) {
+        return 0;
+    }
+
+    if (!sim_clock_realtime_enabled() &&
+        arp_table_get_const(&host->arp_table, next_hop_ip) == NULL) {
+        host_poll_arp(
+            host,
+            now_ms + (HOST_ARP_RETRY_INTERVAL_MS * (HOST_ARP_MAX_ATTEMPTS + 1u)));
+    }
+
+    return 1;
 }
 
 int host_flush_pending_packets(Host* host, const IpAddress* resolved_ip)
@@ -655,6 +744,88 @@ int host_flush_pending_packets(Host* host, const IpAddress* resolved_ip)
     }
 
     return sent;
+}
+
+static void host_report_arp_failure(Host* host, const HostPendingPacket* failed)
+{
+    IPv4Packet ip_packet;
+    ICMPMessage icmp;
+
+    if (host == NULL || failed == NULL || failed->ethertype != ETHERNET_TYPE_IPV4) {
+        return;
+    }
+
+    ipv4_init(&ip_packet);
+    if (!packet_from_bytes((Packet*)&ip_packet, failed->payload, failed->payload_len) ||
+        ip_packet.protocol != IPV4_PROTOCOL_ICMP ||
+        !ip_octets_equal(&ip_packet.src_ip, &host->ip_address)) {
+        return;
+    }
+
+    icmp_init(&icmp);
+    if (!packet_from_bytes((Packet*)&icmp, ip_packet.payload, ip_packet.payload_len) ||
+        icmp.type != ICMP_ECHO_REQUEST) {
+        return;
+    }
+
+    host->last_icmp_type = ICMP_DEST_UNREACHABLE;
+    host->last_icmp_code = 1;
+    host->last_icmp_source = host->ip_address;
+    host->last_icmp_sequence = icmp.sequence;
+    host->has_last_icmp = true;
+    host_record_icmp_rtt(host);
+
+    printf("%s: Destination Host Unreachable for ", host->base.NAME);
+    print_ip_address(&ip_packet.dst_ip);
+    printf(" time=%.1fms\n", host->last_icmp_rtt_ms);
+}
+
+void host_poll_arp(Host* host, double now_ms)
+{
+    HostPendingPacket* pending;
+    HostPendingPacket failed;
+    IpAddress target_ip;
+    unsigned int next_attempt;
+    double attempt_ms;
+
+    if (host == NULL) {
+        return;
+    }
+
+    for (;;) {
+        pending = NULL;
+        size_t index = host->pending_queue.head;
+        for (size_t i = 0; i < host->pending_queue.size; i++) {
+            HostPendingPacket* candidate = &host->pending_queue.items[index];
+            if (candidate->arp_attempts > 0 &&
+                candidate->arp_last_attempt_ms + HOST_ARP_RETRY_INTERVAL_MS <= now_ms) {
+                pending = candidate;
+                break;
+            }
+            index = (index + 1) % HOST_PENDING_QUEUE_MAX_ENTRIES;
+        }
+
+        if (pending == NULL) {
+            return;
+        }
+
+        target_ip = pending->target_ip;
+        if (pending->arp_attempts >= HOST_ARP_MAX_ATTEMPTS) {
+            printf("[%s] ARP resolution failed for ", host->base.NAME);
+            print_ip_address(&target_ip);
+            printf("\n");
+
+            while (host_dequeue_pending_packet_for_ip(host, &target_ip, &failed)) {
+                host_report_arp_failure(host, &failed);
+            }
+            continue;
+        }
+
+        next_attempt = pending->arp_attempts + 1;
+        attempt_ms = pending->arp_last_attempt_ms + HOST_ARP_RETRY_INTERVAL_MS;
+        host_set_arp_attempt_for_ip(host, &target_ip, next_attempt, attempt_ms);
+        host_send_arp_request(host, &target_ip);
+    }
 }
 
 int host_send_icmp_echo_request(Host* host, const IpAddress* target_ip, uint8_t ttl, uint16_t sequence)

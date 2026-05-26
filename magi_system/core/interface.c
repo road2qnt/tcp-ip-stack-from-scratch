@@ -55,7 +55,6 @@ void node_init(Node* node, NodeType type, int num_interfaces){
     node_init_with_macs(node, type, num_interfaces, NULL);
 }
 
-// [!] Belum cek untuk semua MAC Address di Simulator
 void node_init_with_macs(Node* node, NodeType type, int num_interfaces, const MacAddress* mac_addresses){
     if (node == NULL) {
         return;
