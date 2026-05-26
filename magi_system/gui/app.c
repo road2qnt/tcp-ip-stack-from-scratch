@@ -2050,8 +2050,9 @@ int gui_export_topology(Simulator* simulator, const char* output_path)
     render_export(&state);
     SDL_RenderPresent(ren);
 
-    SDL_Surface* surface = SDL_CreateRGBSurface(0, export_w, export_h, 24,
-                                                 0x0000FF, 0x00FF00, 0xFF0000, 0);
+    SDL_Surface* surface = SDL_CreateRGBSurface(0, export_w, export_h, 32,
+                                                 0x00FF0000, 0x0000FF00,
+                                                 0x000000FF, 0xFF000000);
     if (!surface) {
         SDL_DestroyRenderer(ren);
         SDL_DestroyWindow(win);
@@ -2059,8 +2060,14 @@ int gui_export_topology(Simulator* simulator, const char* output_path)
         return -1;
     }
 
-    SDL_RenderReadPixels(ren, NULL, surface->format->format,
-                         surface->pixels, surface->pitch);
+    if (SDL_RenderReadPixels(ren, NULL, surface->format->format,
+                             surface->pixels, surface->pitch) != 0) {
+        SDL_FreeSurface(surface);
+        SDL_DestroyRenderer(ren);
+        SDL_DestroyWindow(win);
+        if (need_sdl_init) SDL_Quit();
+        return -1;
+    }
 
     uint8_t* rgb = (uint8_t*)malloc((size_t)export_w * (size_t)export_h * 3);
     if (!rgb) {
@@ -2072,16 +2079,13 @@ int gui_export_topology(Simulator* simulator, const char* output_path)
     }
 
     for (int y = 0; y < export_h; y++) {
-        uint8_t* src_row = (uint8_t*)surface->pixels + y * surface->pitch;
+        uint32_t* src_row = (uint32_t*)((uint8_t*)surface->pixels + y * surface->pitch);
         uint8_t* dst_row = rgb + y * export_w * 3;
         for (int x = 0; x < export_w; x++) {
-            uint32_t pixel;
-            memcpy(&pixel, src_row + x * 3, 3);
-            uint8_t r_val, g_val, b_val;
-            SDL_GetRGB(pixel, surface->format, &r_val, &g_val, &b_val);
-            dst_row[x * 3 + 0] = r_val;
-            dst_row[x * 3 + 1] = g_val;
-            dst_row[x * 3 + 2] = b_val;
+            uint32_t pixel = src_row[x];
+            dst_row[x * 3 + 0] = (uint8_t)((pixel >> 16) & 0xFF);
+            dst_row[x * 3 + 1] = (uint8_t)((pixel >> 8) & 0xFF);
+            dst_row[x * 3 + 2] = (uint8_t)(pixel & 0xFF);
         }
     }
 
