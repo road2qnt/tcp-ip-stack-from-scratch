@@ -24,9 +24,30 @@ Malaikat ke-11, Ireul, telah menginfeksi dan menghancurkan seluruh protokol komu
 
 * **Bahasa Pemrograman:** C (Language Multiplier: +25)
 * **Compiler:** GCC (dengan flags `-Wall -Wextra -std=c11`)
-* **Dependencies:** Tidak ada. Semua protokol jaringan diimplementasikan dari nol di *user-space*.
-* **Platform:** Linux (direkomendasikan), WSL
+* **Dependencies:**
+  * **Wajib:** Tidak ada untuk fitur inti. Semua protokol jaringan diimplementasikan dari nol di *user-space*.
+  * **Opsional:** SDL2 — diperlukan untuk GUI dan perintah `visualize` (ekspor topologi ke PNG).
+* **Platform:** Linux, macOS, WSL
 * **DILARANG** menggunakan API jaringan bawaan sistem operasi atau *library* simulasi jaringan pihak ketiga.
+
+### Instalasi SDL2 (Opsional — untuk GUI & `visualize`)
+
+**macOS (Homebrew):**
+```bash
+brew install sdl2
+```
+
+**Ubuntu / Debian / WSL:**
+```bash
+sudo apt-get update && sudo apt-get install -y libsdl2-dev
+```
+
+**Windows (MSYS2/MinGW):**
+```bash
+pacman -S mingw-w64-x86_64-SDL2
+```
+
+> Jika SDL2 tidak terinstal, program tetap bisa di-build dan digunakan dalam mode CLI. Fitur GUI (`--gui`) dan perintah `visualize` tidak akan tersedia.
 
 ## Cara Menjalankan Program
 
@@ -37,8 +58,15 @@ make build
 # Atau build + run langsung
 make run
 
+# Atau gunakan run.sh (auto-build + run)
+./run.sh
+
+# Jalankan dengan GUI (SDL2)
+./run.sh --gui
+
 # Atau manual
 ./magi_system.out
+./magi_system.out --gui
 ```
 
 Setelah dijalankan, simulator akan masuk ke mode *interactive prompt*:
@@ -66,6 +94,7 @@ Perintah yang tersedia:
 - `arp` — Lihat tabel ARP
 - `mac` — Lihat tabel MAC switch
 - `debug <milestone/all>` — Jalankan test suite
+- `visualize` — Ekspor topologi ke file PNG di folder `TopologyOutput/`
 - `quit` — Keluar
 
 ## Daftar Periksa Pencapaian (Milestones)
@@ -83,8 +112,8 @@ Perintah yang tersedia:
 
 | No | NPM | Nama | Kontribusi |
 |----|-----|------|------------|
-| 1 | 13524115 | **Ega Luthfi Rais** | M3 Transport Layer (UDP, TCP, TCP Socket State Machine), M2 Integration (Host, Router, IPv4, ICMP), Debugger Suite, CLI Commands, Middleboxes (NAT, ACL), GUI, Layer 7 stubs (DHCP, DNS, HTTP, MagiSocket, RIP), Build System, Utils (JSON, Loader, Visualizer) |
-| 2 | 13524141 | Ahmad Fauzan Putra | bug fixes M1, M2, M4. GUI |
+| 1 | 13524115 | **Ega Luthfi Rais** | M3 Transport Layer (UDP, TCP, TCP Socket State Machine), M2 Integration (Host, Router, IPv4, ICMP), Debugger Suite, CLI Commands, Middleboxes (NAT, ACL), GUI, Topology Visualizer, Layer 7 stubs (DHCP, DNS, HTTP, MagiSocket, RIP), Build System, Utils (JSON, Loader, Visualizer) |
+| 2 | 13524141 | Ahmad Fauzan Putra | bug fixes M1, M2, M4. GUI, Topology visualizer |
 | 3 | 13524146 | **Leonardus Brain Fatolosja** | M0 Fondasi Simulasi (Interface, Link, MAC, Packet, Data Structures), M1 Data Link Layer (Ethernet, ARP, Switch, Host), M2 Network Layer (IPv4, ICMP, Router), CLI & Visualizer awal, Makefile & Project Structure |
 | 4 | 13524134 | Salman Faiz Assidqi | — |
 | 5 | 13524124 | Zahran Alvan Putra Winarko | — |

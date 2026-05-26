@@ -3,9 +3,7 @@
 
 #include "../simulator.h"
 
-// Run the SDL2 topology visualizer.
-// Takes a Simulator* and renders the network topology in an interactive window.
-// Returns 0 on success, -1 on failure (e.g., SDL not available).
 int gui_run(Simulator* simulator);
+int gui_export_topology(Simulator* simulator, const char* output_path);
 
 #endif

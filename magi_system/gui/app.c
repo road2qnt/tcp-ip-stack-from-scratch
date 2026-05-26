@@ -23,7 +23,7 @@
 
 /* ======================== CONFIG ======================== */
 
-#define WINDOW_TITLE  "Magi System - Network Topology Visualizer"
+#define WINDOW_TITLE  "Magi System - GUI"
 #define WINDOW_W      1280
 #define WINDOW_H      720
 #define FONT_W        8
@@ -939,7 +939,7 @@ static void render(AppState* state)
     set_col(r, COL_BG);
     SDL_RenderClear(r);
 
-    draw_string(r, 12, 6, "MAGI SYSTEM - Topology Visualizer",
+    draw_string(r, 12, 6, "MAGI SYSTEM - GUI",
                 COL_R(COL_TITLE), COL_G(COL_TITLE), COL_B(COL_TITLE), COL_A(COL_TITLE));
 
     if (state->sim->node_count == 0) {
@@ -1787,4 +1787,311 @@ int gui_run(Simulator* simulator)
     SDL_DestroyWindow(state.window);
     SDL_Quit();
     return 0;
+}
+
+/* ======================== PNG EXPORT ======================== */
+
+static uint32_t crc32_table[256];
+static int crc32_table_ready = 0;
+
+static void crc32_init_table(void)
+{
+    if (crc32_table_ready) return;
+    for (uint32_t n = 0; n < 256; n++) {
+        uint32_t c = n;
+        for (int k = 0; k < 8; k++) {
+            if (c & 1) c = 0xEDB88320u ^ (c >> 1);
+            else       c = c >> 1;
+        }
+        crc32_table[n] = c;
+    }
+    crc32_table_ready = 1;
+}
+
+static uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len)
+{
+    crc = crc ^ 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++)
+        crc = crc32_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static void png_write_u32be(uint8_t* p, uint32_t v)
+{
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)(v);
+}
+
+static int png_write_chunk(FILE* f, const char* type, const uint8_t* data, uint32_t len)
+{
+    uint8_t hdr[8];
+    png_write_u32be(hdr, len);
+    memcpy(hdr + 4, type, 4);
+    if (fwrite(hdr, 1, 8, f) != 8) return 0;
+
+    uint32_t crc = crc32_update(0, (const uint8_t*)type, 4);
+    if (len > 0 && data) {
+        if (fwrite(data, 1, len, f) != len) return 0;
+        crc = crc32_update(crc, data, len);
+    }
+
+    uint8_t crc_buf[4];
+    png_write_u32be(crc_buf, crc);
+    if (fwrite(crc_buf, 1, 4, f) != 4) return 0;
+    return 1;
+}
+
+static uint32_t adler32_calc(const uint8_t* data, size_t len)
+{
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < len; i++) {
+        a = (a + data[i]) % 65521;
+        b = (b + a) % 65521;
+    }
+    return (b << 16) | a;
+}
+
+static int png_save_rgb(const char* path, const uint8_t* pixels, int w, int h)
+{
+    crc32_init_table();
+    FILE* f = fopen(path, "wb");
+    if (!f) return 0;
+
+    static const uint8_t sig[8] = {137,80,78,71,13,10,26,10};
+    fwrite(sig, 1, 8, f);
+
+    uint8_t ihdr[13];
+    png_write_u32be(ihdr, (uint32_t)w);
+    png_write_u32be(ihdr + 4, (uint32_t)h);
+    ihdr[8] = 8;   /* bit depth */
+    ihdr[9] = 2;   /* color type: RGB */
+    ihdr[10] = 0;  /* compression */
+    ihdr[11] = 0;  /* filter */
+    ihdr[12] = 0;  /* interlace */
+    png_write_chunk(f, "IHDR", ihdr, 13);
+
+    size_t raw_row = 1 + (size_t)w * 3;
+    size_t raw_size = raw_row * (size_t)h;
+    uint8_t* raw = (uint8_t*)malloc(raw_size);
+    if (!raw) { fclose(f); return 0; }
+    for (int y = 0; y < h; y++) {
+        raw[y * raw_row] = 0; /* filter none */
+        memcpy(raw + y * raw_row + 1, pixels + y * w * 3, (size_t)w * 3);
+    }
+
+    uint32_t adler = adler32_calc(raw, raw_size);
+
+    size_t max_block = 65535;
+    size_t num_blocks = (raw_size + max_block - 1) / max_block;
+    size_t deflate_size = 2 + raw_size + 5 * num_blocks + 4;
+    uint8_t* zdata = (uint8_t*)malloc(deflate_size);
+    if (!zdata) { free(raw); fclose(f); return 0; }
+
+    size_t zpos = 0;
+    zdata[zpos++] = 0x78; /* zlib CM=8, CINFO=7 */
+    zdata[zpos++] = 0x01; /* FCHECK */
+
+    size_t remaining = raw_size;
+    size_t src_off = 0;
+    while (remaining > 0) {
+        size_t block = remaining > max_block ? max_block : remaining;
+        int is_final = (remaining <= max_block) ? 1 : 0;
+        zdata[zpos++] = (uint8_t)(is_final ? 0x01 : 0x00);
+        zdata[zpos++] = (uint8_t)(block & 0xFF);
+        zdata[zpos++] = (uint8_t)((block >> 8) & 0xFF);
+        zdata[zpos++] = (uint8_t)(~block & 0xFF);
+        zdata[zpos++] = (uint8_t)((~block >> 8) & 0xFF);
+        memcpy(zdata + zpos, raw + src_off, block);
+        zpos += block;
+        src_off += block;
+        remaining -= block;
+    }
+    free(raw);
+
+    png_write_u32be(zdata + zpos, adler);
+    zpos += 4;
+
+    png_write_chunk(f, "IDAT", zdata, (uint32_t)zpos);
+    free(zdata);
+
+    png_write_chunk(f, "IEND", NULL, 0);
+    fclose(f);
+    return 1;
+}
+
+static void render_export(AppState* state)
+{
+    SDL_Renderer* r = state->renderer;
+
+    set_col(r, COL_BG);
+    SDL_RenderClear(r);
+
+    draw_string(r, 12, 6, "MAGI SYSTEM - GUI",
+                COL_R(COL_TITLE), COL_G(COL_TITLE), COL_B(COL_TITLE), COL_A(COL_TITLE));
+
+    if (state->sim->node_count == 0) {
+        draw_string(r, WINDOW_W / 2 - 140, WINDOW_H / 2,
+                    "No topology loaded.",
+                    0xFF, 0x66, 0x66, 0xFF);
+        return;
+    }
+
+    if (state->needs_layout) layout_nodes(state);
+
+    for (size_t i = 0; i < state->glink_count; i++) {
+        const GLink* gl = &state->glinks[i];
+        int x1 = state->gnodes[gl->n1].x;
+        int y1 = state->gnodes[gl->n1].y;
+        int x2 = state->gnodes[gl->n2].x;
+        int y2 = state->gnodes[gl->n2].y;
+        draw_thick_line(r, x1, y1, x2, y2, COL_LINK);
+
+        char delay_str[16];
+        snprintf(delay_str, sizeof(delay_str), "%.0fms", gl->delay);
+        draw_string(r, (x1 + x2) / 2 + 6, (y1 + y2) / 2 - 6, delay_str,
+                    0x44, 0xCC, 0x88, 0xCC);
+    }
+
+    for (size_t i = 0; i < state->gnode_count; i++) {
+        const GNode* gn = &state->gnodes[i];
+        int x = gn->x - gn->w / 2, y = gn->y - gn->h / 2;
+        uint32_t col = node_color(state->sim->nodes[gn->index].type);
+
+        fill_rounded_rect(r, x, y, gn->w, gn->h, NODE_RADIUS, col);
+
+        const char* name = state->sim->nodes[gn->index].name;
+        int name_pw = (int)strlen(name) * (FONT_W + CHAR_SPACE);
+        draw_string(r, gn->x - name_pw / 2, gn->y - FONT_H_PX / 2,
+                    name, 0xFF, 0xFF, 0xFF, 0xFF);
+
+        const char* tl = node_type_label(state->sim->nodes[gn->index].type);
+        int tl_pw = (int)strlen(tl) * (FONT_W + CHAR_SPACE);
+        draw_string(r, gn->x - tl_pw / 2, gn->y + FONT_H_PX / 2 + 2,
+                    tl, 0x00, 0x00, 0x00, 0xAA);
+    }
+
+    /* Legend */
+    {
+        int lx = LEGEND_X;
+        int ly = WINDOW_H - 30;
+        int x = lx;
+
+        fill_rounded_rect(r, x, ly + 3, 10, 10, 2, COL_HOST);
+        draw_string(r, x + 14, ly + 3, "Host", 0xCC, 0xFF, 0xCC, 0xFF);
+        x += 60;
+        fill_rounded_rect(r, x, ly + 3, 10, 10, 2, COL_SWITCH);
+        draw_string(r, x + 14, ly + 3, "Switch", 0xCC, 0xDD, 0xFF, 0xFF);
+        x += 70;
+        fill_rounded_rect(r, x, ly + 3, 10, 10, 2, COL_ROUTER);
+        draw_string(r, x + 14, ly + 3, "Router", 0xFF, 0xDD, 0xAA, 0xFF);
+    }
+
+    /* Node count */
+    {
+        char info[64];
+        snprintf(info, sizeof(info), "Nodes: %zu  Links: %zu",
+                 state->sim->node_count, state->sim->link_count);
+        int iw = (int)strlen(info) * (FONT_W + CHAR_SPACE);
+        draw_string(r, WINDOW_W - iw - 12, 6, info, 0xCC, 0xDD, 0xEE, 0xFF);
+    }
+}
+
+int gui_export_topology(Simulator* simulator, const char* output_path)
+{
+    if (simulator == NULL || output_path == NULL) return -1;
+
+    int need_sdl_init = 0;
+    if (!SDL_WasInit(SDL_INIT_VIDEO)) {
+        if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+            fprintf(stderr, "SDL init failed: %s\n", SDL_GetError());
+            return -1;
+        }
+        need_sdl_init = 1;
+    }
+
+    int export_w = 1280, export_h = 720;
+    SDL_Window* win = SDL_CreateWindow("export", SDL_WINDOWPOS_UNDEFINED,
+                                       SDL_WINDOWPOS_UNDEFINED,
+                                       export_w, export_h,
+                                       SDL_WINDOW_HIDDEN);
+    if (!win) {
+        fprintf(stderr, "SDL window failed: %s\n", SDL_GetError());
+        if (need_sdl_init) SDL_Quit();
+        return -1;
+    }
+
+    SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+    if (!ren) {
+        fprintf(stderr, "SDL renderer failed: %s\n", SDL_GetError());
+        SDL_DestroyWindow(win);
+        if (need_sdl_init) SDL_Quit();
+        return -1;
+    }
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+
+    AppState state;
+    memset(&state, 0, sizeof(state));
+    state.sim = simulator;
+    state.selected_idx = -1;
+    state.hover_idx = -1;
+    state.running = false;
+    state.needs_layout = true;
+    state.window = win;
+    state.renderer = ren;
+    state.pipe_r = -1;
+    state.pipe_w = -1;
+    state.orig_stdout = -1;
+    state.orig_stderr = -1;
+
+    layout_nodes(&state);
+    render_export(&state);
+    SDL_RenderPresent(ren);
+
+    SDL_Surface* surface = SDL_CreateRGBSurface(0, export_w, export_h, 24,
+                                                 0x0000FF, 0x00FF00, 0xFF0000, 0);
+    if (!surface) {
+        SDL_DestroyRenderer(ren);
+        SDL_DestroyWindow(win);
+        if (need_sdl_init) SDL_Quit();
+        return -1;
+    }
+
+    SDL_RenderReadPixels(ren, NULL, surface->format->format,
+                         surface->pixels, surface->pitch);
+
+    uint8_t* rgb = (uint8_t*)malloc((size_t)export_w * (size_t)export_h * 3);
+    if (!rgb) {
+        SDL_FreeSurface(surface);
+        SDL_DestroyRenderer(ren);
+        SDL_DestroyWindow(win);
+        if (need_sdl_init) SDL_Quit();
+        return -1;
+    }
+
+    for (int y = 0; y < export_h; y++) {
+        uint8_t* src_row = (uint8_t*)surface->pixels + y * surface->pitch;
+        uint8_t* dst_row = rgb + y * export_w * 3;
+        for (int x = 0; x < export_w; x++) {
+            uint32_t pixel;
+            memcpy(&pixel, src_row + x * 3, 3);
+            uint8_t r_val, g_val, b_val;
+            SDL_GetRGB(pixel, surface->format, &r_val, &g_val, &b_val);
+            dst_row[x * 3 + 0] = r_val;
+            dst_row[x * 3 + 1] = g_val;
+            dst_row[x * 3 + 2] = b_val;
+        }
+    }
+
+    int result = png_save_rgb(output_path, rgb, export_w, export_h) ? 0 : -1;
+
+    free(rgb);
+    SDL_FreeSurface(surface);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    if (need_sdl_init) SDL_Quit();
+
+    return result;
 }

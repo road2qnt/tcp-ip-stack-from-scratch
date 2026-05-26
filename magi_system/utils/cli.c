@@ -2,6 +2,11 @@
 #include "loader.h"
 #include "visualizer.h"
 #include "debugger.h"
+#ifdef HAS_SDL
+#include "../gui/app.h"
+#endif
+#include <sys/stat.h>
+#include <time.h>
 #include "../layer2/host.h"
 #include "../layer2/switch.h"
 #include "../layer3/router.h"
@@ -51,6 +56,7 @@ static void print_help(void)
     printf("  <host> http_get <url>\n");
     printf("  <host> http_server start [dir]\n");
     printf("  <host> http_server stop\n");
+    printf("  visualize\n");
     printf("  exit | quit\n");
 }
 
@@ -411,6 +417,23 @@ bool process(char* command){
         return true;
     } else if (strcmp(tokens[0], "topology") == 0){
         simulator_print_topology(&simulator);
+        return true;
+    } else if (strcmp(tokens[0], "visualize") == 0){
+#ifdef HAS_SDL
+        mkdir("TopologyOutput", 0755);
+        time_t now = time(NULL);
+        struct tm* tm_info = localtime(&now);
+        char filename[256];
+        strftime(filename, sizeof(filename),
+                 "TopologyOutput/topology_%Y%m%d_%H%M%S.png", tm_info);
+        if (gui_export_topology(&simulator, filename) == 0) {
+            printf("[SIM] Topology exported to %s\n", filename);
+        } else {
+            printf("[SIM] Failed to export topology\n");
+        }
+#else
+        printf("[SIM] Visualize not available (SDL2 not found at build time)\n");
+#endif
         return true;
     } else if (count >= 2 && strcmp(tokens[1], "ping") == 0) {
         Host* host;
