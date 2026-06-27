@@ -3,12 +3,11 @@
 
 #include "interface.h"
 #include "packet.h"
-#include "unistd.h"
 
 typedef struct Link {
     /*
         1. Data delay untuk simulasi real.
-        2. Panggil send () di interface pengirim dan receive() di interface penerima
+        2. Panggil interface_send() di interface pengirim dan receive() di interface penerima
         3. Menyimpan interface2 yang dihubungkan
     */
     // Node interface 1
@@ -20,8 +19,11 @@ typedef struct Link {
 
 // Method
 
-Link link_init(Interface* interface1_, Interface* interface2_, float delay_);
+void link_init(Link* link, Interface* interface1_, Interface* interface2_, float delay_);
 // Transmit Data (Signal)
-void transmit(Interface* sender, Link* link, uint8_t* packet);
+void transmit(Interface* sender, Link* link, const uint8_t* packet, size_t packet_len);
 
+// Link 
+void link_unlink(Link* link);
+void link_link(Link* link, Interface* int1, Interface* int2);
 #endif

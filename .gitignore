@@ -1,0 +1,23 @@
+# Build artifacts
+magi_system.out
+magi_system_dbg.out
+magi_system_asan.out
+
+# Workflow memory (auto-generated .md documentation)
+memory/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temp files
+/tmp/
+*.tmp
+tes.json
